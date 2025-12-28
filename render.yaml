@@ -1,0 +1,27 @@
+services:
+  - type: cron
+    name: wheel-weekly-screener
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python apps/worker/src/weekly_screener.py
+    # Saturdays 9:15am PT (America/Los_Angeles)
+    schedule: "15 17 * * 6"
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+  - type: cron
+    name: wheel-daily-tracker
+    runtime: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python apps/worker/src/daily_tracker.py
+    # Every weekday 6:05pm PT (post-market, good for MTM snapshot)
+    schedule: "5 2 * * 2-6"
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
