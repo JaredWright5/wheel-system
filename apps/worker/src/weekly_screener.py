@@ -111,8 +111,17 @@ def score_trend_proxy(quote: Dict[str, Any]) -> (int, Dict[str, Any]):
 def main() -> None:
     fmp = FMPClient()
 
-    universe = fmp.sp500_constituents()
-    logger.info(f"Universe size from FMP S&P 500: {len(universe)}")
+    universe = fmp.us_universe()
+    logger.info(f"Universe size from FMP (S&P500 or fallback list): {len(universe)}")
+
+    # If we are using the fallback stock list, filter to major US exchanges
+    majors = {"NYSE", "NASDAQ"}
+    universe = [u for u in universe if (u.get("exchange") or u.get("exchangeShortName") or u.get("exchangeShortName")).upper() in majors or (u.get("exchange") or "").upper() in majors]
+    logger.info(f"Universe after exchange filter (NYSE/NASDAQ): {len(universe)}")
+
+    # Safety cap for v1 runtime (adjust later)
+    universe = universe[:1200]
+    logger.info(f"Universe after cap (first 1200): {len(universe)}")
 
     # Earnings filter window
     start = date.today()
