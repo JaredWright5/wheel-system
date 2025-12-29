@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional
 from loguru import logger
 
 from wheel.clients.fmp_client import FMPClient, simple_sentiment_score
-from wheel.clients.supabase_client import insert_row, upsert_rows
+from wheel.clients.supabase_client import insert_row, upsert_rows, update_rows
 
 
 @dataclass
@@ -200,9 +200,12 @@ def main():
             "updated_at": datetime.utcnow().isoformat(),
         })
 
-    upsert_rows("tickers", ticker_rows)
+    logger.info(f"Upserting tickers: {len(ticker_rows)}")
+upsert_rows("tickers", ticker_rows)
+logger.info("Tickers upserted")
 
-    candidates.sort(key=lambda c: c.wheel_score, reverse=True)
+candidates.sort(key=lambda c: c.wheel_score, reverse=True)
+logger.info(f"Candidates after filters: {len(candidates)}")
 
     # Maintain approved universe (Top 40) for stability week-to-week
     top40 = candidates[:40]
@@ -236,10 +239,17 @@ def main():
             "features": c.features,
             "created_at": datetime.utcnow().isoformat(),
         })
-    upsert_rows("wheel_candidates", cand_rows)
+    logger.info(f"Upserting wheel_candidates: {len(cand_rows)}")
+upsert_rows("wheel_candidates", cand_rows)
+logger.info("wheel_candidates upserted")
+update_rows("screening_runs", {"run_id": run_id}, {"notes": "OK: candidates written"})
 
     logger.info(f"Run complete. run_id={run_id} | candidates={len(candidates)}")
     logger.info("View results in Supabase: screening_runs + wheel_candidates")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.exception("Weekly screener failed")
+        raise
