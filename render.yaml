@@ -4,7 +4,8 @@ services:
     runtime: python
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: python -m apps.worker.src.weekly_screener
-    schedule: "15 17 * * 6"
+    # Monday 6:30am PT (UTC 14:30 during standard time)
+    schedule: "30 13 * * 1"
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
@@ -14,6 +15,7 @@ services:
     runtime: python
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: python -m apps.worker.src.daily_tracker
+    # Every weekday 6:05pm PT (UTC 02:05 next day during standard time)
     schedule: "5 2 * * 2-6"
     envVars:
       - key: PYTHONUNBUFFERED
