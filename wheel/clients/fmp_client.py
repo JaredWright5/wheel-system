@@ -3,9 +3,10 @@ import re
 import requests
 from typing import Any, Dict, List, Optional
 from datetime import date
-from tenacity import retry, wait_exponential, stop_after_attempt, RetryError
+from tenacity import retry, wait_exponential, stop_after_attempt
 
 BASE = "https://financialmodelingprep.com/api/v3"
+VERSION = "fmp_client_v1_stock_list_only"
 
 def _redact_apikey(url: str) -> str:
     return re.sub(r"(apikey=)[^&]+", r"\1REDACTED", url)
@@ -31,54 +32,26 @@ class FMPClient:
         return r.json()
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
-    def sp500_constituents(self) -> List[Dict[str, Any]]:
-        return self._get("sp500_constituent")
-
-    @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
     def stock_list(self) -> List[Dict[str, Any]]:
         return self._get("stock/list")
 
     def us_universe(self) -> List[Dict[str, Any]]:
         """
-        Returns list of dicts with at least: symbol, name, exchange (best effort).
-        Tries S&P 500 first, but that endpoint is legacy for many users; falls back to stock/list.
-        Handles tenacity.RetryError wrapper.
+        v1: Always use stock/list because sp500_constituent is a legacy endpoint for new FMP plans.
+        Returns list of dicts with: symbol, name, exchange
         """
-        def is_legacy_403(exc: Exception) -> bool:
-            msg = str(exc)
-            # Match either the HTTPError message or the legacy endpoint body
-            return ("403" in msg) and ("Legacy Endpoint" in msg or "Forbidden" in msg)
-
-        try:
-            return self.sp500_constituents()
-        except RetryError as e:
-            # tenacity wraps the last exception in e.last_attempt.exception()
-            last = e.last_attempt.exception() if getattr(e, "last_attempt", None) else None
-            if last and is_legacy_403(last):
-                data = self.stock_list()
-                return [
-                    {
-                        "symbol": it.get("symbol"),
-                        "name": it.get("name") or it.get("symbol"),
-                        "exchange": it.get("exchangeShortName") or it.get("exchange"),
-                    }
-                    for it in (data or [])
-                    if it.get("symbol")
-                ]
-            raise
-        except requests.HTTPError as e:
-            if is_legacy_403(e):
-                data = self.stock_list()
-                return [
-                    {
-                        "symbol": it.get("symbol"),
-                        "name": it.get("name") or it.get("symbol"),
-                        "exchange": it.get("exchangeShortName") or it.get("exchange"),
-                    }
-                    for it in (data or [])
-                    if it.get("symbol")
-                ]
-            raise
+        data = self.stock_list()
+        out = []
+        for it in data or []:
+            sym = it.get("symbol")
+            if not sym:
+                continue
+            out.append({
+                "symbol": sym,
+                "name": it.get("name") or sym,
+                "exchange": it.get("exchangeShortName") or it.get("exchange"),
+            })
+        return out
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
     def profile(self, symbol: str) -> Optional[Dict[str, Any]]:
