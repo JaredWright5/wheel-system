@@ -109,7 +109,9 @@ def score_trend_proxy(quote: Dict[str, Any]) -> (int, Dict[str, Any]):
 
 
 def main() -> None:
+    from wheel.clients import fmp_client
     fmp = FMPClient()
+    logger.info(f"Using {fmp_client.VERSION}")
 
     universe = fmp.us_universe()
     logger.info(f"Universe size from FMP (S&P500 or fallback list): {len(universe)}")
