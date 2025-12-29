@@ -216,25 +216,11 @@ def main():
 upsert_rows("tickers", ticker_rows)
 logger.info("Tickers upserted")
 
-candidates.sort(key=lambda c: c.wheel_score, reverse=True)
-logger.info(f"Candidates after filters: {len(candidates)}")
+    # Sort by wheel score (desc)
+    candidates.sort(key=lambda c: c.wheel_score, reverse=True)
+    logger.info(f"Candidates after filters: {len(candidates)}")
 
-    # Maintain approved universe (Top 40) for stability week-to-week
-    top40 = candidates[:40]
-    approved_rows = []
-    for i, c in enumerate(top40, start=1):
-        approved_rows.append({
-            "ticker": c.ticker,
-            "approved": True,
-            "last_run_id": run_id,
-            "last_run_ts": datetime.utcnow().isoformat(),
-            "last_rank": i,
-            "last_score": c.wheel_score,
-            "updated_at": datetime.utcnow().isoformat(),
-        })
-    upsert_rows("approved_universe", approved_rows)
-
-
+    # Write wheel_candidates rows
     cand_rows = []
     for c in candidates:
         cand_rows.append({
@@ -251,10 +237,29 @@ logger.info(f"Candidates after filters: {len(candidates)}")
             "features": c.features,
             "created_at": datetime.utcnow().isoformat(),
         })
+
     logger.info(f"Upserting wheel_candidates: {len(cand_rows)}")
-upsert_rows("wheel_candidates", cand_rows)
-logger.info("wheel_candidates upserted")
-update_rows("screening_runs", {"run_id": run_id}, {"notes": "OK: candidates written"})
+    upsert_rows("wheel_candidates", cand_rows)
+    logger.info("wheel_candidates upserted")
+
+    # Maintain approved universe (Top 40) for stability week-to-week
+    top40 = candidates[:40]
+    approved_rows = []
+    for i, c in enumerate(top40, start=1):
+        approved_rows.append({
+            "ticker": c.ticker,
+            "approved": True,
+            "last_run_id": run_id,
+            "last_run_ts": datetime.utcnow().isoformat(),
+            "last_rank": i,
+            "last_score": c.wheel_score,
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+    logger.info(f"Upserting approved_universe: {len(approved_rows)}")
+    upsert_rows("approved_universe", approved_rows)
+    logger.info("approved_universe upserted")
+
+    update_rows("screening_runs", {"run_id": run_id}, {"notes": "OK: candidates + approved written"})
 
     logger.info(f"Run complete. run_id={run_id} | candidates={len(candidates)}")
     logger.info("View results in Supabase: screening_runs + wheel_candidates")
