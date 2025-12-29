@@ -109,6 +109,7 @@ def main():
     end = start + timedelta(days=10)
     earn = fmp.earnings_calendar(start, end)
     earnings_tickers = {e.get("symbol") for e in earn if e.get("symbol")}
+    logger.info(f"Earnings filtered tickers: {len(earnings_tickers)}")
     logger.info(f"Earnings in window {start}..{end}: {len(earnings_tickers)} tickers")
 
     run_row = insert_row("screening_runs", {
@@ -121,6 +122,11 @@ def main():
         raise RuntimeError("Failed to create screening run (missing run_id)")
 
     candidates: List[Candidate] = []
+
+    mcap_pass = 0
+    prof_missing = 0
+    quote_missing = 0
+
     ticker_rows: List[Dict[str, Any]] = []
 
     MIN_MARKET_CAP = 20_000_000_000  # $20B
@@ -138,9 +144,15 @@ def main():
         ratios = fmp.ratios_ttm(t) or {}
         km = fmp.key_metrics_ttm(t) or {}
 
+        if not profile:
+            prof_missing += 1
+        if not quote:
+            quote_missing += 1
+
         mcap = profile.get("mktCap") or quote.get("marketCap")
         if mcap is None or mcap < MIN_MARKET_CAP:
             continue
+        mcap_pass += 1
 
         news = fmp.stock_news(t, limit=40)
         sent = simple_sentiment_score(news)
