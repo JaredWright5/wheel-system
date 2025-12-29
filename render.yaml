@@ -4,7 +4,7 @@ services:
     runtime: python
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: python -m apps.worker.src.weekly_screener
-    # Monday 6:30am PT (UTC 14:30 during standard time)
+    # Monday 5:30am PT (UTC 13:30 during standard time)
     schedule: "30 13 * * 1"
     envVars:
       - key: PYTHONUNBUFFERED
