@@ -6,8 +6,8 @@ from typing import Dict, Any, List, Optional
 
 from loguru import logger
 
-from packages.core.src.clients.fmp_client import FMPClient, simple_sentiment_score
-from packages.core.src.clients.supabase_client import insert_row, upsert_rows
+from wheel.clients.fmp_client import FMPClient, simple_sentiment_score
+from wheel.clients.supabase_client import insert_row, upsert_rows
 
 
 @dataclass

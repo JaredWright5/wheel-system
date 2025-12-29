@@ -1,5 +1,5 @@
 from loguru import logger
-from packages.core.src.alerts.emailer import send_email
+from wheel.alerts.emailer import send_email
 
 def main():
     # TODO: replace with real MTM + premium-capture summary once tracker is implemented
