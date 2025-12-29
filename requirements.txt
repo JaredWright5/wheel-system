@@ -1,10 +1,7 @@
 python-dotenv==1.0.1
 requests==2.32.3
 pydantic==2.8.2
-pandas==2.2.2
-numpy==1.26.4
 supabase==2.5.1
 loguru==0.7.2
 tenacity==8.5.0
 python-dateutil==2.9.0.post0
-
