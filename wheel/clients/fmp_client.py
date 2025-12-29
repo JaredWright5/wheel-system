@@ -3,9 +3,12 @@ import re
 import requests
 from typing import Any, Dict, List, Optional
 from datetime import date
-from tenacity import retry, wait_exponential, stop_after_attempt
+from tenacity import retry, wait_exponential, stop_after_attempt, RetryError
 
 BASE = "https://financialmodelingprep.com/api/v3"
+
+def _redact_apikey(url: str) -> str:
+    return re.sub(r"(apikey=)[^&]+", r"\1REDACTED", url)
 
 class FMPClient:
     def __init__(self, api_key: Optional[str] = None, timeout: int = 25):
@@ -19,10 +22,12 @@ class FMPClient:
         params["apikey"] = self.api_key
         url = f"{BASE}/{path.lstrip('/')}"
         r = requests.get(url, params=params, timeout=self.timeout)
-        # Raise with full context for debugging
         if r.status_code >= 400:
-            safe_url = re.sub(r"(apikey=)[^&]+", r"\1REDACTED", r.url)
-        raise requests.HTTPError(f"{r.status_code} {r.reason} for url: {safe_url} | body: {r.text[:300]}", response=r)
+            safe_url = _redact_apikey(r.url)
+            raise requests.HTTPError(
+                f"{r.status_code} {r.reason} for url: {safe_url} | body: {r.text[:300]}",
+                response=r
+            )
         return r.json()
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
@@ -31,32 +36,48 @@ class FMPClient:
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
     def stock_list(self) -> List[Dict[str, Any]]:
-        # Broad list of stocks (usually available on most plans)
         return self._get("stock/list")
 
     def us_universe(self) -> List[Dict[str, Any]]:
         """
-        Returns list of dicts with at least: symbol, name (best effort).
-        Tries S&P 500 first, falls back to stock/list if forbidden.
+        Returns list of dicts with at least: symbol, name, exchange (best effort).
+        Tries S&P 500 first, but that endpoint is legacy for many users; falls back to stock/list.
+        Handles tenacity.RetryError wrapper.
         """
+        def is_legacy_403(exc: Exception) -> bool:
+            msg = str(exc)
+            # Match either the HTTPError message or the legacy endpoint body
+            return ("403" in msg) and ("Legacy Endpoint" in msg or "Forbidden" in msg)
+
         try:
             return self.sp500_constituents()
-        except requests.HTTPError as e:
-            # 403 -> fallback
-            if getattr(e.response, "status_code", None) == 403 or "403" in str(e):
+        except RetryError as e:
+            # tenacity wraps the last exception in e.last_attempt.exception()
+            last = e.last_attempt.exception() if getattr(e, "last_attempt", None) else None
+            if last and is_legacy_403(last):
                 data = self.stock_list()
-                # Normalize to match expected keys
-                out = []
-                for it in data or []:
-                    sym = it.get("symbol")
-                    if not sym:
-                        continue
-                    out.append({
-                        "symbol": sym,
-                        "name": it.get("name") or sym,
+                return [
+                    {
+                        "symbol": it.get("symbol"),
+                        "name": it.get("name") or it.get("symbol"),
                         "exchange": it.get("exchangeShortName") or it.get("exchange"),
-                    })
-                return out
+                    }
+                    for it in (data or [])
+                    if it.get("symbol")
+                ]
+            raise
+        except requests.HTTPError as e:
+            if is_legacy_403(e):
+                data = self.stock_list()
+                return [
+                    {
+                        "symbol": it.get("symbol"),
+                        "name": it.get("name") or it.get("symbol"),
+                        "exchange": it.get("exchangeShortName") or it.get("exchange"),
+                    }
+                    for it in (data or [])
+                    if it.get("symbol")
+                ]
             raise
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
