@@ -32,7 +32,7 @@ def clamp_int(x: float, lo: int, hi: int) -> int:
 
 
 def score_fundamentals(profile: Dict[str, Any], ratios: Dict[str, Any], km: Dict[str, Any]) -> (int, Dict[str, Any]):
-    feats = {}
+    feats: Dict[str, Any] = {}
 
     npm = ratios.get("netProfitMarginTTM")
     opm = ratios.get("operatingProfitMarginTTM")
@@ -46,6 +46,7 @@ def score_fundamentals(profile: Dict[str, Any], ratios: Dict[str, Any], km: Dict
     s = 0.0
     w = 0.0
 
+    # Profitability
     if npm is not None:
         s += (min(max(npm, -0.10), 0.30) + 0.10) / 0.40 * 25
         w += 25
@@ -55,6 +56,8 @@ def score_fundamentals(profile: Dict[str, Any], ratios: Dict[str, Any], km: Dict
     if roe is not None:
         s += min(max(roe, 0.0), 0.35) / 0.35 * 25
         w += 25
+
+    # Valuation sanity (light touch)
     if pe is not None and pe > 0:
         if pe <= 25:
             v = 1.0
@@ -64,6 +67,8 @@ def score_fundamentals(profile: Dict[str, Any], ratios: Dict[str, Any], km: Dict
             v = 0.2
         s += v * 20
         w += 20
+
+    # Leverage sanity
     if de is not None and de >= 0:
         if de <= 1.0:
             v = 1.0
@@ -76,11 +81,13 @@ def score_fundamentals(profile: Dict[str, Any], ratios: Dict[str, Any], km: Dict
 
     if w == 0:
         return 40, feats
+
     score = (s / w) * 100
     return clamp_int(score, 0, 100), feats
 
 
 def score_sentiment(sent: float) -> int:
+    # sent in [-1, 1] -> score [0, 100]
     return clamp_int((sent + 1) * 50, 0, 100)
 
 
@@ -89,53 +96,55 @@ def score_trend_proxy(quote: Dict[str, Any]) -> (int, Dict[str, Any]):
     low = quote.get("yearLow")
     high = quote.get("yearHigh")
 
-    feats = {"price": price, "yearLow": low, "yearHigh": high}
+    feats: Dict[str, Any] = {"price": price, "yearLow": low, "yearHigh": high}
 
     if price is None or low is None or high is None or high == low:
         return 50, feats
 
-    pos = (price - low) / (high - low)
+    pos = (price - low) / (high - low)  # 0..1
+    # Prefer middle-ish of 52w range (avoid extremes)
     score = 100 * (1 - min(abs(pos - 0.5) / 0.5, 1))
-    return clamp_int(score, 0, 100), {**feats, "pos_52w": pos}
+    feats["pos_52w"] = pos
+    return clamp_int(score, 0, 100), feats
 
 
-def main():
+def main() -> None:
     fmp = FMPClient()
 
     universe = fmp.sp500_constituents()
     logger.info(f"Universe size from FMP S&P 500: {len(universe)}")
 
+    # Earnings filter window
     start = date.today()
     end = start + timedelta(days=10)
     earn = fmp.earnings_calendar(start, end)
     earnings_tickers = {e.get("symbol") for e in earn if e.get("symbol")}
-    logger.info(f"Earnings filtered tickers: {len(earnings_tickers)}")
-    logger.info(f"Earnings in window {start}..{end}: {len(earnings_tickers)} tickers")
+    logger.info(f"Earnings filtered tickers (next ~10d): {len(earnings_tickers)}")
 
     run_row = insert_row("screening_runs", {
         "run_ts": datetime.utcnow().isoformat(),
         "universe_size": len(universe),
-        "notes": "v1 fundamentals-only (premium/liquidity pending Schwab); dashboard-first"
+        "notes": "STARTED: weekly screener running"
     })
     run_id = run_row.get("run_id")
     if not run_id:
         raise RuntimeError("Failed to create screening run (missing run_id)")
 
+    MIN_MARKET_CAP = 20_000_000_000  # $20B (adjust later)
+
     candidates: List[Candidate] = []
-
-    mcap_pass = 0
-    prof_missing = 0
-    quote_missing = 0
-
     ticker_rows: List[Dict[str, Any]] = []
 
-    MIN_MARKET_CAP = 20_000_000_000  # $20B
+    prof_missing = 0
+    quote_missing = 0
+    mcap_pass = 0
 
     for item in universe:
         t = item.get("symbol")
         if not t:
             continue
 
+        # skip earnings tickers in the near window
         if t in earnings_tickers:
             continue
 
@@ -152,6 +161,7 @@ def main():
         mcap = profile.get("mktCap") or quote.get("marketCap")
         if mcap is None or mcap < MIN_MARKET_CAP:
             continue
+
         mcap_pass += 1
 
         news = fmp.stock_news(t, limit=40)
@@ -161,8 +171,7 @@ def main():
         f_score, f_feats = score_fundamentals(profile, ratios, km)
         trend_score, t_feats = score_trend_proxy(quote)
 
-        events_score = 100
-
+        events_score = 100  # placeholder until Schwab event-risk gates
         wheel_score = clamp_int(0.55 * f_score + 0.15 * sent_score + 0.30 * trend_score, 0, 100)
 
         name = profile.get("companyName") or item.get("name") or t
@@ -172,14 +181,14 @@ def main():
         reasons = {
             "earnings_in_window": False,
             "market_cap_min": MIN_MARKET_CAP,
-            "notes": "Options premium/liquidity gates will apply once Schwab options are integrated."
+            "notes": "Options premium/liquidity gates will apply once Schwab is integrated."
         }
 
         features = {
             "fundamentals": f_feats,
             "trend": t_feats,
             "sentiment": {"score": sent, "sent_score": sent_score},
-            "market_cap": mcap,
+            "market_cap": int(mcap) if mcap is not None else None,
             "sector": sector,
             "industry": industry,
         }
@@ -212,16 +221,17 @@ def main():
             "updated_at": datetime.utcnow().isoformat(),
         })
 
+    logger.info(f"Filter stats: prof_missing={prof_missing}, quote_missing={quote_missing}, mcap_pass={mcap_pass}")
     logger.info(f"Upserting tickers: {len(ticker_rows)}")
-upsert_rows("tickers", ticker_rows)
-logger.info("Tickers upserted")
+    upsert_rows("tickers", ticker_rows)
+    logger.info("Tickers upserted")
 
     # Sort by wheel score (desc)
     candidates.sort(key=lambda c: c.wheel_score, reverse=True)
     logger.info(f"Candidates after filters: {len(candidates)}")
 
     # Write wheel_candidates rows
-    cand_rows = []
+    cand_rows: List[Dict[str, Any]] = []
     for c in candidates:
         cand_rows.append({
             "run_id": run_id,
@@ -244,7 +254,7 @@ logger.info("Tickers upserted")
 
     # Maintain approved universe (Top 40) for stability week-to-week
     top40 = candidates[:40]
-    approved_rows = []
+    approved_rows: List[Dict[str, Any]] = []
     for i, c in enumerate(top40, start=1):
         approved_rows.append({
             "ticker": c.ticker,
@@ -255,6 +265,7 @@ logger.info("Tickers upserted")
             "last_score": c.wheel_score,
             "updated_at": datetime.utcnow().isoformat(),
         })
+
     logger.info(f"Upserting approved_universe: {len(approved_rows)}")
     upsert_rows("approved_universe", approved_rows)
     logger.info("approved_universe upserted")
@@ -262,11 +273,11 @@ logger.info("Tickers upserted")
     update_rows("screening_runs", {"run_id": run_id}, {"notes": "OK: candidates + approved written"})
 
     logger.info(f"Run complete. run_id={run_id} | candidates={len(candidates)}")
-    logger.info("View results in Supabase: screening_runs + wheel_candidates")
+
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
+    except Exception:
         logger.exception("Weekly screener failed")
         raise
