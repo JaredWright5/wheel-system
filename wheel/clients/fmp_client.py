@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from typing import Any, Dict, List, Optional
 from datetime import date
@@ -20,7 +21,8 @@ class FMPClient:
         r = requests.get(url, params=params, timeout=self.timeout)
         # Raise with full context for debugging
         if r.status_code >= 400:
-            raise requests.HTTPError(f"{r.status_code} {r.reason} for url: {r.url} | body: {r.text[:300]}", response=r)
+            safe_url = re.sub(r"(apikey=)[^&]+", r"\1REDACTED", r.url)
+        raise requests.HTTPError(f"{r.status_code} {r.reason} for url: {safe_url} | body: {r.text[:300]}", response=r)
         return r.json()
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
