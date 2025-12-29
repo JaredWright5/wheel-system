@@ -204,6 +204,22 @@ def main():
 
     candidates.sort(key=lambda c: c.wheel_score, reverse=True)
 
+    # Maintain approved universe (Top 40) for stability week-to-week
+    top40 = candidates[:40]
+    approved_rows = []
+    for i, c in enumerate(top40, start=1):
+        approved_rows.append({
+            "ticker": c.ticker,
+            "approved": True,
+            "last_run_id": run_id,
+            "last_run_ts": datetime.utcnow().isoformat(),
+            "last_rank": i,
+            "last_score": c.wheel_score,
+            "updated_at": datetime.utcnow().isoformat(),
+        })
+    upsert_rows("approved_universe", approved_rows)
+
+
     cand_rows = []
     for c in candidates:
         cand_rows.append({
