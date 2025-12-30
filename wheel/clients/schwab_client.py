@@ -4,7 +4,7 @@ import base64
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 from loguru import logger
@@ -33,6 +33,7 @@ class SchwabClient:
         self.timeout_s = timeout_s
         self._access_token: Optional[str] = None
         self._access_token_expiry_epoch: float = 0.0
+        self._account_hash: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "SchwabClient":
@@ -139,45 +140,62 @@ class SchwabClient:
     def get_accounts(self) -> Any:
         return self._request("GET", "/accounts")
 
+    def get_account_numbers(self) -> List[Dict[str, Any]]:
+        """
+        Returns mappings of Schwab accountNumber <-> hashValue.
+        Endpoint: /trader/v1/accounts/accountNumbers
+        """
+        data = self._request("GET", "/accounts/accountNumbers")
+        if not isinstance(data, list):
+            logger.warning(f"Unexpected accountNumbers type={type(data)} body={data}")
+            return []
+        return data
+
+    def _resolve_account_hash(self) -> str:
+        """
+        Single-account mode: grab first hashValue from accountNumbers and cache it.
+        """
+        if self._account_hash:
+            return self._account_hash
+
+        mappings = self.get_account_numbers()
+        if not mappings:
+            raise RuntimeError("No accounts returned from /accounts/accountNumbers")
+
+        if len(mappings) > 1:
+            logger.warning(f"Multiple accounts detected ({len(mappings)}). Using first hashValue.")
+
+        hv = mappings[0].get("hashValue")
+        if not hv:
+            raise RuntimeError(f"accountNumbers missing hashValue. First keys={list(mappings[0].keys())}")
+
+        self._account_hash = hv
+        logger.info("Resolved Schwab account hashValue (cached).")
+        return hv
+
     def resolve_account_hash(self, accounts_payload=None) -> str:
         """
-        Schwab Trader API endpoints require account hashValue in the URL path.
-        Accepts optional accounts_payload (list) to avoid making an extra call.
+        Public method for resolving account hash (maintains backward compatibility).
+        Uses cached value if available, otherwise calls _resolve_account_hash.
         """
-        accounts = accounts_payload if accounts_payload is not None else self.get_accounts()
+        # Ignore accounts_payload parameter (new implementation uses cached endpoint)
+        return self._resolve_account_hash()
 
-        items = accounts if isinstance(accounts, list) else accounts.get("accounts", []) if isinstance(accounts, dict) else []
-        if not items:
-            raise RuntimeError("No accounts returned from Schwab /accounts.")
+    def get_account(self, fields: str = None) -> dict:
+        """
+        Single-account mode: automatically uses encrypted hashValue.
+        """
+        account_hash = self._resolve_account_hash()
+        params = {"fields": fields} if fields else None
+        return self._request("GET", f"/accounts/{account_hash}", params=params)
 
-        desired = (self.cfg.account_id or "").strip()
-
-        # payload items often look like: {"accountNumber": "...", "hashValue": "..."}
-        # 1) If desired already equals a hashValue, return it
-        if desired:
-            for a in items:
-                hv = a.get("hashValue")
-                if hv and desired == hv:
-                    return hv
-
-        # 2) If desired matches the accountNumber, return its hashValue
-        if desired:
-            for a in items:
-                acct_num = a.get("accountNumber")
-                hv = a.get("hashValue")
-                if hv and acct_num and desired == str(acct_num):
-                    return hv
-
-        # 3) Fall back to first hashValue
-        hv0 = items[0].get("hashValue")
-        if hv0:
-            return hv0
-
-        raise RuntimeError(f"Could not resolve account hash. First account item keys={list(items[0].keys())}")
-
-    def get_account(self, account_id: str, fields: str = "positions") -> Any:
-        # fields can include positions/orders; we'll keep minimal
-        return self._request("GET", f"/accounts/{account_id}", params={"fields": fields})
+    def get_positions(self):
+        account_hash = self._resolve_account_hash()
+        return self._request(
+            "GET",
+            f"/accounts/{account_hash}",
+            params={"fields": "positions"},
+        )
 
     def get_orders(self, account_id: str, from_date: str, to_date: str) -> Any:
         return self._request("GET", f"/accounts/{account_id}/orders", params={"fromEnteredTime": from_date, "toEnteredTime": to_date})

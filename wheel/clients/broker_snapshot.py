@@ -13,19 +13,8 @@ def snapshot_schwab_account(account_id: Optional[str] = None) -> Dict[str, Any]:
     schwab = SchwabClient.from_env()
     sb = get_supabase()
 
-    # determine account_id
-    if not account_id:
-        if schwab.cfg.account_id:
-            account_id = schwab.cfg.account_id
-        else:
-            accts = schwab.get_accounts()
-            if isinstance(accts, list) and accts:
-                account_id = accts[0].get("accountNumber") or accts[0].get("hashValue") or accts[0].get("accountId")
-
-    if not account_id:
-        raise RuntimeError("No Schwab account_id found. Set SCHWAB_ACCOUNT_ID env var.")
-
-    acct = schwab.get_account(account_id, fields="positions")
+    acct = schwab.get_account(fields="positions")
+    logger.info("Account fetched OK.")
 
     # defensive parse
     raw = acct
@@ -42,10 +31,13 @@ def snapshot_schwab_account(account_id: Optional[str] = None) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # Get account hash for storage
+    account_hash = schwab._resolve_account_hash()
+    
     row = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "source": "schwab",
-        "account_id": str(account_id),
+        "account_id": str(account_hash),
         "cash": cash,
         "net_liquidation": net_liq,
         "positions": positions,
