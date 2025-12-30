@@ -4,7 +4,7 @@ services:
     runtime: python
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: PYTHONPATH=/opt/render/project/src python -m apps.worker.src.weekly_screener
-    schedule: "30 12 * * 1"  # 5:30 AM PT (PDT) / 4:30 AM PT (PST) - UTC doesn't adjust for DST
+    schedule: "30 12 * * 1"  # 4:30 AM PST / 5:30 AM PDT (auto-adjusts with DST)
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
