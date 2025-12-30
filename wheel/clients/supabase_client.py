@@ -15,11 +15,36 @@ def _raise_if_error(res, context: str) -> None:
     if err:
         raise RuntimeError(f"Supabase error during {context}: {err}")
 
-def upsert_rows(table: str, rows: List[Dict[str, Any]]) -> None:
+def upsert_rows(table: str, rows: List[Dict[str, Any]], *, key: Optional[str] = None) -> None:
+    """Upsert rows into Supabase, safely deduping within the batch by conflict key.
+
+    Postgres error 21000 happens when the same unique key appears twice in ONE upsert call.
+    We dedupe in-Python to ensure each constrained key appears once per request.
+    """
     if not rows:
-        return
+        return None
+
+    # sensible defaults
+    if key is None:
+        if table == "tickers":
+            key = "ticker"
+        elif table in ("screening_candidates", "screening_picks"):
+            key = "id"
+        else:
+            key = "id"
+
+    deduped = {}
+    for r in rows:
+        k = r.get(key)
+        if k is None:
+            # if key missing, keep row but don't use it for dedupe
+            # (these rows may fail server-side; better to catch upstream later)
+            k = f"__missing__{len(deduped)}"
+        deduped[k] = r  # last one wins
+
+    payload = list(deduped.values())
     sb = get_supabase()
-    res = sb.table(table).upsert(rows).execute()
+    res = sb.table(table).upsert(payload).execute()
     _raise_if_error(res, f"upsert_rows({table})")
 
 def insert_row(table: str, row: Dict[str, Any]) -> Dict[str, Any]:
