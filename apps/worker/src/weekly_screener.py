@@ -130,23 +130,15 @@ def main() -> None:
     universe = load_universe_csv("data/universe_us.csv")
     logger.info(f"Universe size from CSV: {len(universe)}")
 
-    # Earnings filter window
-    start = date.today()
-    end = start + timedelta(days=10)
-    # Earnings filter (best-effort). Some FMP plans block this endpoint (legacy 403).
+    # NOTE: Earnings filtering temporarily disabled (FMP legacy endpoints)
+    # TODO: Re-enable using non-legacy earnings source
+
 
     try:
 
-        earn = fmp.earnings_calendar(start, end)
-
     except Exception as e:
 
-        logger.warning(f"Earnings calendar unavailable; skipping earnings filter. err={e}")
-
         earn = []
-earnings_tickers = {e.get("symbol") for e in earn if e.get("symbol")}
-    logger.info(f"Earnings filtered tickers (next ~10d): {len(earnings_tickers)}")
-
     run_row = insert_row("screening_runs", {
         "run_ts": datetime.utcnow().isoformat(),
         "universe_size": len(universe),
@@ -170,8 +162,6 @@ earnings_tickers = {e.get("symbol") for e in earn if e.get("symbol")}
         if not t:
             continue
 
-        # skip earnings tickers in the near window
-        if t in earnings_tickers:
             continue
 
         profile = fmp.profile(t) or {}
@@ -205,7 +195,6 @@ earnings_tickers = {e.get("symbol") for e in earn if e.get("symbol")}
         industry = profile.get("industry") or item.get("subSector")
 
         reasons = {
-            "earnings_in_window": False,
             "market_cap_min": MIN_MARKET_CAP,
             "notes": "Options premium/liquidity gates will apply once Schwab is integrated."
         }
