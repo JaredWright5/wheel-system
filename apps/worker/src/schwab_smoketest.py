@@ -13,17 +13,10 @@ def main():
     accounts = schwab.get_accounts()
     logger.info(f"Accounts response type={type(accounts)}")
 
-    # Pick account id: env var first, else first account in list
-    account_id = schwab.cfg.account_id
-    if not account_id:
-        # Schwab often returns a list of account objects; try to find an id
-        if isinstance(accounts, list) and accounts:
-            account_id = accounts[0].get("accountNumber") or accounts[0].get("hashValue") or accounts[0].get("accountId")
-        if not account_id:
-            raise RuntimeError("Could not determine SCHWAB_ACCOUNT_ID from /accounts response. Set SCHWAB_ACCOUNT_ID in env.")
-
-    acct = schwab.get_account(account_id, fields="positions")
-    logger.info(f"Account fetched OK. account_id={account_id}")
+    # Schwab Trader API uses account HASH in the URL path
+    account_hash = schwab.resolve_account_hash()
+    acct = schwab.get_account(account_hash, fields="positions")
+    logger.info(f"Account fetched OK. account_hash={account_hash}")
 
     # Simple position count
     positions = []
@@ -48,7 +41,7 @@ def main():
     to = now.isoformat()
 
     try:
-        orders = schwab.get_orders(account_id, frm, to)
+        orders = schwab.get_orders(account_hash, frm, to)
         if orders is None:
             orders = []
         logger.info(f"Orders (last 7d) count: {len(orders) if isinstance(orders, list) else 'non-list'}")
