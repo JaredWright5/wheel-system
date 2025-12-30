@@ -7,6 +7,9 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 from loguru import logger
+import os
+BUILD_SHA = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown"
+
 
 from wheel.clients.fmp_client import FMPClient, simple_sentiment_score
 from wheel.clients.supabase_client import insert_row, upsert_rows, update_rows
@@ -128,6 +131,7 @@ def main() -> None:
     fmp = FMPClient()
 
     universe = load_universe_csv("data/universe_us.csv")
+    logger.info(f"Build SHA: {BUILD_SHA}")
     logger.info(f"Universe size from CSV: {len(universe)}")
 
     # NOTE: Earnings filtering temporarily disabled (FMP legacy endpoints)
