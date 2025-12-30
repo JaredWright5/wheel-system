@@ -133,8 +133,18 @@ def main() -> None:
     # Earnings filter window
     start = date.today()
     end = start + timedelta(days=10)
-    earn = fmp.earnings_calendar(start, end)
-    earnings_tickers = {e.get("symbol") for e in earn if e.get("symbol")}
+    # Earnings filter (best-effort). Some FMP plans block this endpoint (legacy 403).
+
+    try:
+
+        earn = fmp.earnings_calendar(start, end)
+
+    except Exception as e:
+
+        logger.warning(f"Earnings calendar unavailable; skipping earnings filter. err={e}")
+
+        earn = []
+earnings_tickers = {e.get("symbol") for e in earn if e.get("symbol")}
     logger.info(f"Earnings filtered tickers (next ~10d): {len(earnings_tickers)}")
 
     run_row = insert_row("screening_runs", {
