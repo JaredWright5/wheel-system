@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from datetime import date
 from tenacity import retry, wait_exponential, stop_after_attempt
 
-BASE = "https://financialmodelingprep.com/api/v3"
+BASE = "https://financialmodelingprep.com/stable"
 
 def _redact_apikey(url: str) -> str:
     return re.sub(r"(apikey=)[^&]+", r"\1REDACTED", url)
@@ -52,7 +52,7 @@ class FMPClient:
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
     def earnings_calendar(self, start: date, end: date) -> List[Dict[str, Any]]:
-        return self._get("earning_calendar", params={"from": start.isoformat(), "to": end.isoformat()})
+        return self._get("earnings-calendar", params={"from": start.isoformat(), "to": end.isoformat()})
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
     def stock_news(self, symbol: str, limit: int = 50) -> List[Dict[str, Any]]:

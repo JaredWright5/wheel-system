@@ -131,7 +131,7 @@ def main() -> None:
     logger.info(f"Universe size from CSV: {len(universe)}")
 
     # NOTE: Earnings filtering temporarily disabled (FMP legacy endpoints)
-    # TODO: Re-enable using non-legacy earnings source
+#     # TODO: Re-enable using non-legacy earnings source
 
     run_row = insert_row("screening_runs", {
         "run_ts": datetime.utcnow().isoformat(),
