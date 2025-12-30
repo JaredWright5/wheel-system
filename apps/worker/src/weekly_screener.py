@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, date
+from datetime import datetime, timezone, timedelta, date
 import csv
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -138,7 +138,7 @@ def main() -> None:
 #     # TODO: Re-enable using non-legacy earnings source
 
     run_row = insert_row("screening_runs", {
-        "run_ts": datetime.utcnow().isoformat(),
+        "run_ts": datetime.now(timezone.utc).isoformat(),
         "universe_size": len(universe),
         "notes": "STARTED: weekly screener running"
     })
@@ -237,7 +237,7 @@ def main() -> None:
             "market_cap": int(mcap) if mcap is not None else None,
             "currency": profile.get("currency") or "USD",
             "is_active": True,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         })
 
     logger.info(f"Filter stats: prof_missing={prof_missing}, quote_missing={quote_missing}, mcap_pass={mcap_pass}")
@@ -264,7 +264,7 @@ def main() -> None:
             "gates_passed": c.gates_passed,
             "reasons": c.reasons,
             "features": c.features,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
         })
 
     logger.info(f"Upserting wheel_candidates: {len(cand_rows)}")
@@ -279,10 +279,10 @@ def main() -> None:
             "ticker": c.ticker,
             "approved": True,
             "last_run_id": run_id,
-            "last_run_ts": datetime.utcnow().isoformat(),
+            "last_run_ts": datetime.now(timezone.utc).isoformat(),
             "last_rank": i,
             "last_score": c.wheel_score,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         })
 
     logger.info(f"Upserting approved_universe: {len(approved_rows)}")
