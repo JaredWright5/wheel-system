@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
+import csv
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 
 from loguru import logger
@@ -26,6 +28,20 @@ class Candidate:
     reasons: Dict[str, Any]
     features: Dict[str, Any]
 
+
+
+def load_universe_csv(path: str) -> List[Dict[str, Any]]:
+    p = Path(path)
+    if not p.exists():
+        raise RuntimeError(f"Universe CSV not found: {path}")
+    out: List[Dict[str, Any]] = []
+    with p.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            sym = (row.get("symbol") or "").strip()
+            if sym:
+                out.append({"symbol": sym, "name": sym, "exchange": None})
+    return out
 
 def clamp_int(x: float, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(round(x))))
@@ -113,8 +129,8 @@ def main() -> None:
     fmp = FMPClient()
     logger.info(f"Using {fmp_client.VERSION}")
 
-    universe = fmp.us_universe()
-    logger.info(f"Universe size from FMP (S&P500 or fallback list): {len(universe)}")
+    universe = load_universe_csv("data/universe_us.csv")
+    logger.info(f"Universe size from CSV: {len(universe)}")
 
     # If we are using the fallback stock list, filter to major US exchanges
     majors = {"NYSE", "NASDAQ"}
