@@ -133,12 +133,6 @@ def main() -> None:
     # NOTE: Earnings filtering temporarily disabled (FMP legacy endpoints)
     # TODO: Re-enable using non-legacy earnings source
 
-
-    try:
-
-    except Exception as e:
-
-        earn = []
     run_row = insert_row("screening_runs", {
         "run_ts": datetime.utcnow().isoformat(),
         "universe_size": len(universe),
