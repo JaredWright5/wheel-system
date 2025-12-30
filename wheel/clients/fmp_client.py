@@ -32,8 +32,18 @@ class FMPClient:
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
     def profile(self, symbol: str) -> Optional[Dict[str, Any]]:
-        data = self._get(f"profile/{symbol}")
-        return data[0] if isinstance(data, list) and data else None
+        """Stable API: /stable/profile?symbol=AAPL"""
+        try:
+            data = self._get("profile", params={"symbol": symbol})
+            # Stable returns a list; take first item if present
+            if isinstance(data, list) and data:
+                return data[0]
+            if isinstance(data, dict):
+                return data
+            return {}
+        except Exception:
+            # Non-fatal: if profile is unavailable for a symbol, skip it
+            return {}
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
     def quote(self, symbol: str) -> Optional[Dict[str, Any]]:
