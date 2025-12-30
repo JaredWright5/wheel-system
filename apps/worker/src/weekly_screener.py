@@ -166,7 +166,10 @@ def main() -> None:
             profile = fmp.profile(t) or {}
         except Exception:
             profile = {}
-        quote = fmp.quote(t) or {}
+        try:
+            quote = fmp.quote(t) or {}
+        except Exception:
+            quote = {}
         ratios = fmp.ratios_ttm(t) or {}
         km = fmp.key_metrics_ttm(t) or {}
 
