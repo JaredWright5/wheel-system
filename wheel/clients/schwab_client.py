@@ -139,61 +139,41 @@ class SchwabClient:
     def get_accounts(self) -> Any:
         return self._request("GET", "/accounts")
 
-    def resolve_account_hash(self) -> str:
+    def resolve_account_hash(self, accounts_payload=None) -> str:
         """
-        Schwab Trader API uses account hash (hashValue) in URL paths, not the plain account number.
-        This function resolves a usable account hash.
-        
-        Note: The /accounts endpoint may not return hashValue. In that case, we fall back to
-        using the accountNumber, though some endpoints may require the actual hashValue.
+        Schwab Trader API endpoints require account hashValue in the URL path.
+        Accepts optional accounts_payload (list) to avoid making an extra call.
         """
-        accounts = self.get_accounts()
+        accounts = accounts_payload if accounts_payload is not None else self.get_accounts()
 
-        # Accounts payload shape varies; handle list/dict defensively
         items = accounts if isinstance(accounts, list) else accounts.get("accounts", []) if isinstance(accounts, dict) else []
         if not items:
             raise RuntimeError("No accounts returned from Schwab /accounts.")
 
-        # Extract securitiesAccount from each item (accounts are nested)
-        def get_sec_account(item):
-            return item.get("securitiesAccount", item) if isinstance(item, dict) else {}
-
-        # If user provided an account_id, treat it as either:
-        # - hashValue (preferred), OR
-        # - accountNumber (human readable)
         desired = (self.cfg.account_id or "").strip()
 
-        # 1) If desired already matches a hashValue, return it
+        # payload items often look like: {"accountNumber": "...", "hashValue": "..."}
+        # 1) If desired already equals a hashValue, return it
         if desired:
-            for item in items:
-                sec = get_sec_account(item)
-                hv = sec.get("hashValue")
+            for a in items:
+                hv = a.get("hashValue")
                 if hv and desired == hv:
                     return hv
 
-        # 2) If desired matches accountNumber, return its hashValue (or accountNumber as fallback)
+        # 2) If desired matches the accountNumber, return its hashValue
         if desired:
-            for item in items:
-                sec = get_sec_account(item)
-                acct_num = sec.get("accountNumber")
-                hv = sec.get("hashValue")
-                if acct_num and desired == str(acct_num):
-                    # Prefer hashValue if available, otherwise use accountNumber
-                    return hv if hv else str(acct_num)
+            for a in items:
+                acct_num = a.get("accountNumber")
+                hv = a.get("hashValue")
+                if hv and acct_num and desired == str(acct_num):
+                    return hv
 
-        # 3) Otherwise take the first account's hashValue or accountNumber
-        sec0 = get_sec_account(items[0])
-        hv0 = sec0.get("hashValue")
+        # 3) Fall back to first hashValue
+        hv0 = items[0].get("hashValue")
         if hv0:
             return hv0
-        
-        # Fallback: use accountNumber if hashValue not available
-        acct_num0 = sec0.get("accountNumber")
-        if acct_num0:
-            logger.warning(f"hashValue not found in /accounts response, using accountNumber: {acct_num0}")
-            return str(acct_num0)
 
-        raise RuntimeError(f"Could not resolve account hash. Accounts payload: {items[:1]}")
+        raise RuntimeError(f"Could not resolve account hash. First account item keys={list(items[0].keys())}")
 
     def get_account(self, account_id: str, fields: str = "positions") -> Any:
         # fields can include positions/orders; we'll keep minimal
