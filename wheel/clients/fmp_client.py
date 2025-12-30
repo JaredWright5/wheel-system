@@ -22,6 +22,8 @@ class FMPClient:
         params["apikey"] = self.api_key
         url = f"{BASE}/{path.lstrip('/')}"
         r = requests.get(url, params=params, timeout=self.timeout)
+        if r.status_code == 404:
+            return []
         if r.status_code >= 400:
             safe_url = _redact_apikey(r.url)
             raise requests.HTTPError(
@@ -47,8 +49,16 @@ class FMPClient:
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
     def quote(self, symbol: str) -> Optional[Dict[str, Any]]:
-        data = self._get(f"quote/{symbol}")
-        return data[0] if isinstance(data, list) and data else None
+        """Stable API: /stable/quote?symbol=AAPL"""
+        try:
+            data = self._get("quote", params={"symbol": symbol})
+            if isinstance(data, list) and data:
+                return data[0]
+            if isinstance(data, dict):
+                return data
+            return {}
+        except Exception:
+            return {}
 
     @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(2))
     def key_metrics_ttm(self, symbol: str) -> Optional[Dict[str, Any]]:
