@@ -1,15 +1,12 @@
 from loguru import logger
-from wheel.alerts.emailer import send_email
+from wheel.clients.broker_snapshot import snapshot_schwab_account
 
 def main():
-    # TODO: replace with real MTM + premium-capture summary once tracker is implemented
-    subject = "Wheel v1 — Daily Tracker (stub)"
-    body = "\n".join([
-        "Daily tracker ran successfully (stub).",
-        "",
-        "Next: pull Schwab executions + positions, store MTM, compute premium capture.",
-    ])
-    send_email(subject, body)
+    logger.info("Starting daily tracker...")
+    
+    # Snapshot Schwab account (positions, balances)
+    snapshot_schwab_account()
+    
     logger.info("daily_tracker completed.")
 
 if __name__ == "__main__":

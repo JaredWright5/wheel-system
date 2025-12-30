@@ -18,3 +18,13 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+
+  - type: cron
+    name: wheel-schwab-smoketest
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: PYTHONPATH=/opt/render/project/src python -m apps.worker.src.schwab_smoketest
+    schedule: "10 12 * * 1-5"  # 4:10 AM PST / 5:10 AM PDT (auto-adjusts with DST)
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
