@@ -1,6 +1,8 @@
 import os
 from typing import Any, Dict, List, Optional
+
 from supabase import create_client, Client
+
 
 def get_supabase() -> Client:
     url = os.getenv("SUPABASE_URL")
@@ -9,20 +11,34 @@ def get_supabase() -> Client:
         raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
     return create_client(url, key)
 
+
+# Backwards-compatible alias (so other modules can call either name)
+def get_supabase_client() -> Client:
+    return get_supabase()
+
+
 def _raise_if_error(res, context: str) -> None:
-    # supabase-py returns an object with .data and .error
+    # supabase-py returns an object with .data and sometimes .error
     err = getattr(res, "error", None)
     if err:
         raise RuntimeError(f"Supabase error during {context}: {err}")
 
-def upsert_rows(table: str, rows: list[dict], *, key: str | None = None, keys: list[str] | None = None):
-    """Upsert rows into Supabase, safely deduping within the batch by conflict key(s).
+
+def upsert_rows(
+    table: str,
+    rows: List[Dict[str, Any]],
+    *,
+    key: Optional[str] = None,
+    keys: Optional[List[str]] = None,
+):
+    """
+    Upsert rows into Supabase, safely deduping within the batch by conflict key(s).
 
     Postgres error 21000 happens when the same unique key appears twice in ONE upsert call.
     We dedupe in-Python to ensure each constrained key appears once per request.
 
-    - Use `key="ticker"` for single-key dedupe
-    - Use `keys=["run_id","ticker"]` for composite-key dedupe
+    - Use key="ticker" for single-key dedupe
+    - Use keys=["run_id","ticker"] for composite-key dedupe
     """
     if not rows:
         return None
@@ -32,7 +48,6 @@ def upsert_rows(table: str, rows: list[dict], *, key: str | None = None, keys: l
         if table == "tickers":
             key = "ticker"
         elif table in ("wheel_candidates", "screening_candidates", "screening_picks"):
-            # most likely uniqueness is per run per ticker
             keys = ["run_id", "ticker"]
         else:
             key = "id"
@@ -48,20 +63,24 @@ def upsert_rows(table: str, rows: list[dict], *, key: str | None = None, keys: l
         k = make_k(r)
         if k is None or (keys and any(v is None for v in k)):
             missing += 1
-            # still keep the row, but ensure unique placeholder
             k = ("__missing__", missing)
         deduped[k] = r  # last one wins
 
     payload = list(deduped.values())
+
     sb = get_supabase()
     res = sb.table(table).upsert(payload).execute()
     _raise_if_error(res, f"upsert_rows({table})")
+    return res.data
+
+
 def insert_row(table: str, row: Dict[str, Any]) -> Dict[str, Any]:
     sb = get_supabase()
     res = sb.table(table).insert(row).execute()
     _raise_if_error(res, f"insert_row({table})")
     data = res.data or []
     return data[0] if data else {}
+
 
 def update_rows(table: str, match: Dict[str, Any], values: Dict[str, Any]) -> None:
     sb = get_supabase()
