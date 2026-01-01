@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block title %}Candidates - Wheel System{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h2>Top 25 Candidates (Latest Run)</h2>
+</div>
+
+{% if has_error %}
+<div class="error-message">
+    <p>⚠️ View not found; run migrations to create v_latest_run_top25_candidates.</p>
+</div>
+{% elif candidates|length == 0 %}
+<div class="info-message">
+    <p>No candidates found for the latest run.</p>
+</div>
+{% else %}
+<div class="table-container">
+    <table>
+        <thead>
+            <tr>
+                <th>Rank</th>
+                <th>Ticker</th>
+                <th>Score</th>
+                <th>Price</th>
+                <th>IV</th>
+                <th>IV Rank</th>
+                <th>Beta</th>
+                <th>RSI</th>
+                <th>Earnings Days</th>
+                <th>Sentiment</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for cand in candidates %}
+            <tr>
+                <td>{{ cand.rank if cand.rank is not none else '-' }}</td>
+                <td><strong>{{ cand.ticker }}</strong></td>
+                <td>{{ "%.1f"|format(cand.score) if cand.score is not none else '-' }}</td>
+                <td>${{ "%.2f"|format(cand.price) if cand.price is not none else '-' }}</td>
+                <td>{{ "%.2f"|format(cand.iv) if cand.iv is not none else '-' }}</td>
+                <td>{{ "%.1f"|format(cand.iv_rank) if cand.iv_rank is not none else '-' }}</td>
+                <td>{{ "%.2f"|format(cand.beta) if cand.beta is not none else '-' }}</td>
+                <td>{{ "%.1f"|format(cand.rsi) if cand.rsi is not none else '-' }}</td>
+                <td>{{ cand.earn_in_days if cand.earn_in_days is not none else '-' }}</td>
+                <td>{{ "%.2f"|format(cand.sentiment_score) if cand.sentiment_score is not none else '-' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+{% endblock %}
+

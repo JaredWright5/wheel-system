@@ -1,0 +1,124 @@
+"""
+Dashboard v1: FastAPI web app for viewing screening results
+"""
+import os
+from typing import List, Dict, Any
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
+from loguru import logger
+
+from wheel.clients.supabase_client import select_all
+
+# Load environment variables
+load_dotenv(".env.local")
+
+app = FastAPI(title="Wheel System Dashboard v1")
+
+# Mount static files
+app.mount("/static", StaticFiles(directory="apps/dashboard/static"), name="static")
+
+# Templates
+templates = Jinja2Templates(directory="apps/dashboard/templates")
+
+
+def _safe_select(view_name: str, limit: int = 100) -> List[Dict[str, Any]]:
+    """Safe select that returns empty list if view doesn't exist."""
+    try:
+        return select_all(view_name, limit)
+    except Exception as e:
+        logger.warning(f"Failed to query {view_name}: {e}")
+        return []
+
+
+@app.get("/health")
+def health():
+    """Health check endpoint."""
+    return {"ok": True}
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    """Home page: summary with latest candidates, CSP picks, and CC picks."""
+    candidates = _safe_select("v_latest_run_top25_candidates", limit=25)
+    csp_picks = _safe_select("v_latest_run_csp_picks", limit=50)
+    cc_picks = _safe_select("v_latest_run_cc_picks", limit=50)
+    runs = _safe_select("v_run_history", limit=5)  # Latest 5 runs for summary
+    
+    # Get latest run info
+    latest_run = runs[0] if runs else None
+    
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "candidates": candidates,
+            "csp_picks": csp_picks,
+            "cc_picks": cc_picks,
+            "latest_run": latest_run,
+            "candidates_error": len(candidates) == 0 and len(runs) > 0,
+            "csp_error": len(csp_picks) == 0 and len(runs) > 0,
+            "cc_error": len(cc_picks) == 0 and len(runs) > 0,
+        },
+    )
+
+
+@app.get("/runs", response_class=HTMLResponse)
+def runs(request: Request):
+    """Run history page."""
+    runs_data = _safe_select("v_run_history", limit=200)
+    has_error = False
+    
+    # Try to detect if view exists by checking if we got any data or if there's a real error
+    # For now, we'll show empty table if no data (could be legitimately empty)
+    
+    return templates.TemplateResponse(
+        "runs.html",
+        {
+            "request": request,
+            "runs": runs_data,
+            "has_error": has_error,
+        },
+    )
+
+
+@app.get("/candidates", response_class=HTMLResponse)
+def candidates(request: Request):
+    """Latest top 25 candidates page."""
+    candidates_data = _safe_select("v_latest_run_top25_candidates", limit=25)
+    
+    return templates.TemplateResponse(
+        "candidates.html",
+        {
+            "request": request,
+            "candidates": candidates_data,
+            "has_error": len(candidates_data) == 0,
+        },
+    )
+
+
+@app.get("/picks", response_class=HTMLResponse)
+def picks(request: Request):
+    """Picks page: CSP and CC picks."""
+    csp_picks = _safe_select("v_latest_run_csp_picks", limit=50)
+    cc_picks = _safe_select("v_latest_run_cc_picks", limit=50)
+    
+    return templates.TemplateResponse(
+        "picks.html",
+        {
+            "request": request,
+            "csp_picks": csp_picks,
+            "cc_picks": cc_picks,
+            "csp_error": len(csp_picks) == 0,
+            "cc_error": len(cc_picks) == 0,
+        },
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+

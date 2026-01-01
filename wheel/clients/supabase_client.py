@@ -89,3 +89,23 @@ def update_rows(table: str, match: Dict[str, Any], values: Dict[str, Any]) -> No
         q = q.eq(k, v)
     res = q.execute()
     _raise_if_error(res, f"update_rows({table})")
+
+
+def select_all(table_or_view: str, limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    Helper to select all rows from a table or view.
+    
+    Args:
+        table_or_view: Table or view name
+        limit: Maximum number of rows to return
+        
+    Returns:
+        List of dictionaries
+        
+    Raises:
+        RuntimeError: If Supabase query fails
+    """
+    sb = get_supabase()
+    res = sb.table(table_or_view).select("*").limit(limit).execute()
+    _raise_if_error(res, f"select_all({table_or_view})")
+    return res.data or []

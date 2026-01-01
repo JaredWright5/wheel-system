@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block title %}Run History - Wheel System{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <h2>Run History</h2>
+    <p>Last 200 screening runs</p>
+</div>
+
+{% if runs|length == 0 %}
+<div class="info-message">
+    <p>No run history found. Run migrations to create v_run_history view, or wait for the first screening run to complete.</p>
+</div>
+{% else %}
+<div class="table-container">
+    <table>
+        <thead>
+            <tr>
+                <th>Run ID</th>
+                <th>Run Time</th>
+                <th>Status</th>
+                <th>Universe Size</th>
+                <th>Candidates</th>
+                <th>Picks</th>
+                <th>Build SHA</th>
+                <th>Notes</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for run in runs %}
+            <tr class="{% if run.status == 'success' %}status-success{% elif run.status == 'failed' %}status-failed{% elif run.status == 'running' %}status-running{% endif %}">
+                <td class="mono">{{ run.run_id[:8] }}...</td>
+                <td>{{ run.run_ts[:19] if run.run_ts else '-' }}</td>
+                <td>
+                    <span class="status-badge status-{{ run.status or 'unknown' }}">
+                        {{ run.status or 'N/A' }}
+                    </span>
+                </td>
+                <td>{{ run.universe_size if run.universe_size is not none else '-' }}</td>
+                <td>{{ run.candidates_count if run.candidates_count is not none else '-' }}</td>
+                <td>{{ run.picks_count if run.picks_count is not none else '-' }}</td>
+                <td class="mono">{{ run.build_sha[:8] if run.build_sha else '-' }}</td>
+                <td class="notes">{{ run.notes or '-' }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+{% endblock %}
+

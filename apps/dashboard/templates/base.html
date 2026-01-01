@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Wheel System Dashboard{% endblock %}</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <nav>
+            <h1>Wheel System Dashboard</h1>
+            <ul>
+                <li><a href="/">Home</a></li>
+                <li><a href="/runs">Runs</a></li>
+                <li><a href="/candidates">Candidates</a></li>
+                <li><a href="/picks">Picks</a></li>
+            </ul>
+        </nav>
+    </header>
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+    <footer>
+        <p>Wheel System Dashboard v1</p>
+    </footer>
+</body>
+</html>
+

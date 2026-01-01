@@ -1,5 +1,14 @@
 # Render cron is UTC; 12:30 UTC = 4:30am PT during PST. During PDT this should be 11:30 UTC.
 services:
+  - type: web
+    name: wheel-dashboard
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: PYTHONPATH=/opt/render/project/src uvicorn apps.dashboard.app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
   - type: cron
     name: wheel-weekly-screener
     runtime: python
