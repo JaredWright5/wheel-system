@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from loguru import logger
 
 from wheel.clients.supabase_client import insert_row
@@ -6,7 +6,7 @@ from wheel.clients.supabase_client import insert_row
 def main():
     logger.info("Starting Supabase smoketest...")
     row = insert_row("screening_runs", {
-        "run_ts": datetime.utcnow().isoformat(),
+        "run_ts": datetime.now(timezone.utc).isoformat(),
         "universe_size": 0,
         "notes": "SMOKETEST"
     })

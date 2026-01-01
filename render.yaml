@@ -1,10 +1,11 @@
+# Render cron is UTC; 12:30 UTC = 4:30am PT during PST. During PDT this should be 11:30 UTC.
 services:
   - type: cron
     name: wheel-weekly-screener
     runtime: python
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: PYTHONPATH=/opt/render/project/src python -m apps.worker.src.weekly_screener
-    schedule: "30 12 * * 1"  # 4:30 AM PST / 5:30 AM PDT (auto-adjusts with DST)
+    schedule: "30 12 * * 1"  # Monday 4:30 AM PT (12:30 UTC during PST)
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
@@ -14,7 +15,7 @@ services:
     runtime: python
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: PYTHONPATH=/opt/render/project/src python -m apps.worker.src.daily_tracker
-    schedule: "5 2 * * 2-6"
+    schedule: "30 12 * * 2-6"  # Weekdays 4:30 AM PT (12:30 UTC during PST)
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
@@ -24,7 +25,17 @@ services:
     runtime: python
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: PYTHONPATH=/opt/render/project/src python -m apps.worker.src.schwab_smoketest
-    schedule: "10 12 * * 1-5"  # 4:10 AM PST / 5:10 AM PDT (auto-adjusts with DST)
+    schedule: "25 12 * * *"  # Daily 4:25 AM PT (12:25 UTC during PST)
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+  - type: cron
+    name: wheel-build-csp-picks
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: PYTHONPATH=/opt/render/project/src python -m apps.worker.src.build_csp_picks
+    schedule: "30 12 * * 1"  # Monday 4:30 AM PT (12:30 UTC during PST)
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"

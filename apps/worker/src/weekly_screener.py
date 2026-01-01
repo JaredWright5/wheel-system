@@ -5,10 +5,13 @@ from datetime import datetime, timezone, timedelta, date
 import csv
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-
+from dotenv import load_dotenv
 from loguru import logger
 import os
-BUILD_SHA = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "unknown"
+
+# Load environment variables from .env.local
+load_dotenv(".env.local")
+BUILD_SHA = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "local"
 
 
 from wheel.clients.fmp_client import FMPClient, simple_sentiment_score
@@ -128,175 +131,227 @@ def score_trend_proxy(quote: Dict[str, Any]) -> (int, Dict[str, Any]):
 
 
 def main() -> None:
-    fmp = FMPClient()
+    run_id: Optional[str] = None
+    
+    try:
+        fmp = FMPClient()
 
-    universe = load_universe_csv("data/universe_us.csv")
-    logger.info(f"Build SHA: {BUILD_SHA}")
-    logger.info(f"Universe size from CSV: {len(universe)}")
+        universe = load_universe_csv("data/universe_us.csv")
+        logger.info(f"Build SHA: {BUILD_SHA}")
+        logger.info(f"Universe size from CSV: {len(universe)}")
 
-    # NOTE: Earnings filtering temporarily disabled (FMP legacy endpoints)
-#     # TODO: Re-enable using non-legacy earnings source
+        # NOTE: Earnings filtering temporarily disabled (FMP legacy endpoints)
+    #     # TODO: Re-enable using non-legacy earnings source
 
-    run_row = insert_row("screening_runs", {
-        "run_ts": datetime.now(timezone.utc).isoformat(),
-        "universe_size": len(universe),
-        "notes": "STARTED: weekly screener running"
-    })
-    run_id = run_row.get("run_id")
-    if not run_id:
-        raise RuntimeError("Failed to create screening run (missing run_id)")
+        # Insert run row with status='running'
+        run_row = insert_row("screening_runs", {
+            "run_ts": datetime.now(timezone.utc).isoformat(),
+            "universe_size": len(universe),
+            "status": "running",
+            "build_sha": BUILD_SHA,
+            "notes": "STARTED: weekly screener running"
+        })
+        run_id = run_row.get("run_id")
+        if not run_id:
+            raise RuntimeError("Failed to create screening run (missing run_id)")
+        
+        logger.info(f"Screening run started: run_id={run_id}")
 
-    MIN_MARKET_CAP = 20_000_000_000  # $20B (adjust later)
+        MIN_MARKET_CAP = 20_000_000_000  # $20B (adjust later)
 
-    candidates: List[Candidate] = []
-    ticker_rows: List[Dict[str, Any]] = []
+        candidates: List[Candidate] = []
+        ticker_rows: List[Dict[str, Any]] = []
 
-    prof_missing = 0
-    quote_missing = 0
-    mcap_pass = 0
+        prof_missing = 0
+        quote_missing = 0
+        mcap_pass = 0
 
-    for item in universe:
-        t = item.get("symbol")
-        if not t:
-            continue
+        for item in universe:
+            t = item.get("symbol")
+            if not t:
+                continue
 
-            continue
+            try:
+                profile = fmp.profile(t) or {}
+            except Exception:
+                profile = {}
+            try:
+                quote = fmp.quote(t) or {}
+            except Exception:
+                quote = {}
+            ratios = fmp.ratios_ttm(t) or {}
+            km = fmp.key_metrics_ttm(t) or {}
 
-        try:
-            profile = fmp.profile(t) or {}
-        except Exception:
-            profile = {}
-        try:
-            quote = fmp.quote(t) or {}
-        except Exception:
-            quote = {}
-        ratios = fmp.ratios_ttm(t) or {}
-        km = fmp.key_metrics_ttm(t) or {}
+            if not profile:
+                prof_missing += 1
+            if not quote:
+                quote_missing += 1
 
-        if not profile:
-            prof_missing += 1
-        if not quote:
-            quote_missing += 1
+            mcap = profile.get("mktCap") or quote.get("marketCap")
+            if mcap is None or mcap < MIN_MARKET_CAP:
+                continue
 
-        mcap = profile.get("mktCap") or quote.get("marketCap")
-        if mcap is None or mcap < MIN_MARKET_CAP:
-            continue
+            mcap_pass += 1
 
-        mcap_pass += 1
+            news = fmp.stock_news(t, limit=40)
+            sent = simple_sentiment_score(news)
+            sent_score = score_sentiment(sent)
 
-        news = fmp.stock_news(t, limit=40)
-        sent = simple_sentiment_score(news)
-        sent_score = score_sentiment(sent)
+            f_score, f_feats = score_fundamentals(profile, ratios, km)
+            trend_score, t_feats = score_trend_proxy(quote)
 
-        f_score, f_feats = score_fundamentals(profile, ratios, km)
-        trend_score, t_feats = score_trend_proxy(quote)
+            events_score = 100  # placeholder until Schwab event-risk gates
+            wheel_score = clamp_int(0.55 * f_score + 0.15 * sent_score + 0.30 * trend_score, 0, 100)
 
-        events_score = 100  # placeholder until Schwab event-risk gates
-        wheel_score = clamp_int(0.55 * f_score + 0.15 * sent_score + 0.30 * trend_score, 0, 100)
+            name = profile.get("companyName") or item.get("name") or t
+            sector = profile.get("sector") or item.get("sector")
+            industry = profile.get("industry") or item.get("subSector")
 
-        name = profile.get("companyName") or item.get("name") or t
-        sector = profile.get("sector") or item.get("sector")
-        industry = profile.get("industry") or item.get("subSector")
+            reasons = {
+                "market_cap_min": MIN_MARKET_CAP,
+                "notes": "Options premium/liquidity gates will apply once Schwab is integrated."
+            }
 
-        reasons = {
-            "market_cap_min": MIN_MARKET_CAP,
-            "notes": "Options premium/liquidity gates will apply once Schwab is integrated."
-        }
+            # Extract price from quote for later use
+            price = quote.get("price")
+            
+            features = {
+                "fundamentals": f_feats,
+                "trend": t_feats,
+                "sentiment": {"score": sent, "sent_score": sent_score},
+                "market_cap": int(mcap) if mcap is not None else None,
+                "sector": sector,
+                "industry": industry,
+                "price": price,  # Store price in features for easy access
+            }
 
-        features = {
-            "fundamentals": f_feats,
-            "trend": t_feats,
-            "sentiment": {"score": sent, "sent_score": sent_score},
-            "market_cap": int(mcap) if mcap is not None else None,
-            "sector": sector,
-            "industry": industry,
-        }
+            candidates.append(Candidate(
+                ticker=t,
+                name=name,
+                sector=sector,
+                industry=industry,
+                market_cap=int(mcap) if mcap is not None else None,
+                fundamentals_score=f_score,
+                sentiment_score=sent_score,
+                trend_score=trend_score,
+                events_score=events_score,
+                wheel_score=wheel_score,
+                gates_passed=True,
+                reasons=reasons,
+                features=features
+            ))
 
-        candidates.append(Candidate(
-            ticker=t,
-            name=name,
-            sector=sector,
-            industry=industry,
-            market_cap=int(mcap) if mcap is not None else None,
-            fundamentals_score=f_score,
-            sentiment_score=sent_score,
-            trend_score=trend_score,
-            events_score=events_score,
-            wheel_score=wheel_score,
-            gates_passed=True,
-            reasons=reasons,
-            features=features
-        ))
+            ticker_rows.append({
+                "ticker": t,
+                "name": name,
+                "exchange": profile.get("exchangeShortName") or profile.get("exchange"),
+                "sector": sector,
+                "industry": industry,
+                "market_cap": int(mcap) if mcap is not None else None,
+                "currency": profile.get("currency") or "USD",
+                "is_active": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
 
-        ticker_rows.append({
-            "ticker": t,
-            "name": name,
-            "exchange": profile.get("exchangeShortName") or profile.get("exchange"),
-            "sector": sector,
-            "industry": industry,
-            "market_cap": int(mcap) if mcap is not None else None,
-            "currency": profile.get("currency") or "USD",
-            "is_active": True,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+        logger.info(f"Filter stats: prof_missing={prof_missing}, quote_missing={quote_missing}, mcap_pass={mcap_pass}")
+        logger.info(f"Upserting tickers: {len(ticker_rows)}")
+        upsert_rows("tickers", ticker_rows)
+        logger.info("Tickers upserted")
+
+        # Sort by wheel score (desc)
+        candidates.sort(key=lambda c: c.wheel_score, reverse=True)
+        logger.info(f"Candidates after filters: {len(candidates)}")
+
+        # Write screening_candidates rows with new structure
+        cand_rows: List[Dict[str, Any]] = []
+        for i, c in enumerate(candidates, start=1):
+            # Build metrics dict from features and other candidate data
+            metrics = {
+                "wheel_score": c.wheel_score,
+                "fundamentals_score": c.fundamentals_score,
+                "sentiment_score": c.sentiment_score,
+                "trend_score": c.trend_score,
+                "events_score": c.events_score,
+                "gates_passed": c.gates_passed,
+                "reasons": c.reasons,
+                "features": c.features,
+            }
+            
+            # Extract price from features (we stored it directly there)
+            price = c.features.get("price")
+            
+            cand_rows.append({
+                "run_id": run_id,
+                "ticker": c.ticker,
+                "score": int(c.wheel_score),
+                "rank": i,
+                "price": price,
+                "market_cap": c.market_cap,
+                "sector": c.sector,
+                "industry": c.industry,
+                "iv": None,  # TODO: Add IV from options data
+                "iv_rank": None,  # TODO: Add IV rank from options data
+                "beta": None,  # TODO: Add beta from profile/key_metrics
+                "rsi": None,  # TODO: Add RSI from technical indicators
+                "earn_in_days": None,  # TODO: Add earnings calendar logic
+                "sentiment_score": c.sentiment_score,
+                "metrics": metrics,  # Full candidate data dump
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+        logger.info(f"Upserting screening_candidates: {len(cand_rows)}")
+        upsert_rows("screening_candidates", cand_rows, keys=["run_id", "ticker"])
+        logger.info("screening_candidates upserted")
+
+        # Maintain approved universe (Top 40) for stability week-to-week
+        top40 = candidates[:40]
+        approved_rows: List[Dict[str, Any]] = []
+        for i, c in enumerate(top40, start=1):
+            approved_rows.append({
+                "ticker": c.ticker,
+                "approved": True,
+                "last_run_id": run_id,
+                "last_run_ts": datetime.now(timezone.utc).isoformat(),
+                "last_rank": i,
+                "last_score": c.wheel_score,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+        logger.info(f"Upserting approved_universe: {len(approved_rows)}")
+        upsert_rows("approved_universe", approved_rows)
+        logger.info("approved_universe upserted")
+
+        # Update run with success status and counts
+        candidates_count = len(candidates)
+        update_rows("screening_runs", {"run_id": run_id}, {
+            "status": "success",
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "candidates_count": candidates_count,
+            "picks_count": 0,  # Picks are created by build_csp_picks.py separately
+            "notes": "OK: candidates + approved written"
         })
 
-    logger.info(f"Filter stats: prof_missing={prof_missing}, quote_missing={quote_missing}, mcap_pass={mcap_pass}")
-    logger.info(f"Upserting tickers: {len(ticker_rows)}")
-    upsert_rows("tickers", ticker_rows)
-    logger.info("Tickers upserted")
-
-    # Sort by wheel score (desc)
-    candidates.sort(key=lambda c: c.wheel_score, reverse=True)
-    logger.info(f"Candidates after filters: {len(candidates)}")
-
-    # Write wheel_candidates rows
-    cand_rows: List[Dict[str, Any]] = []
-    for c in candidates:
-        cand_rows.append({
-            "run_id": run_id,
-            "ticker": c.ticker,
-            "wheel_score": c.wheel_score,
-            "score_premium": 0,
-            "score_liquidity": 0,
-            "score_fundamentals": c.fundamentals_score,
-            "score_trend": c.trend_score,
-            "score_events": c.events_score,
-            "gates_passed": c.gates_passed,
-            "reasons": c.reasons,
-            "features": c.features,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-
-    logger.info(f"Upserting wheel_candidates: {len(cand_rows)}")
-    upsert_rows("wheel_candidates", cand_rows)
-    logger.info("wheel_candidates upserted")
-
-    # Maintain approved universe (Top 40) for stability week-to-week
-    top40 = candidates[:40]
-    approved_rows: List[Dict[str, Any]] = []
-    for i, c in enumerate(top40, start=1):
-        approved_rows.append({
-            "ticker": c.ticker,
-            "approved": True,
-            "last_run_id": run_id,
-            "last_run_ts": datetime.now(timezone.utc).isoformat(),
-            "last_rank": i,
-            "last_score": c.wheel_score,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        })
-
-    logger.info(f"Upserting approved_universe: {len(approved_rows)}")
-    upsert_rows("approved_universe", approved_rows)
-    logger.info("approved_universe upserted")
-
-    update_rows("screening_runs", {"run_id": run_id}, {"notes": "OK: candidates + approved written"})
-
-    logger.info(f"Run complete. run_id={run_id} | candidates={len(candidates)}")
+        logger.info(f"Run complete. run_id={run_id} | status=success | candidates={candidates_count} | picks=0")
+        
+    except Exception as e:
+        # Update run with failed status and error message
+        error_msg = str(e)[:800]  # Trim to first ~800 chars
+        finished_at = datetime.now(timezone.utc).isoformat()
+        
+        if run_id:
+            try:
+                update_rows("screening_runs", {"run_id": run_id}, {
+                    "status": "failed",
+                    "finished_at": finished_at,
+                    "error": error_msg
+                })
+                logger.error(f"Run failed. run_id={run_id} | status=failed | error={error_msg[:100]}...")
+            except Exception as update_err:
+                logger.exception(f"Failed to update run status to 'failed': {update_err}")
+        
+        # Re-raise the original exception after updating the run
+        raise
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        logger.exception("Weekly screener failed")
-        raise
+    main()

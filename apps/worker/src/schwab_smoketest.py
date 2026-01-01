@@ -1,5 +1,9 @@
+from dotenv import load_dotenv
 from loguru import logger
 from wheel.clients.schwab_client import SchwabClient
+
+# Load environment variables from .env.local
+load_dotenv(".env.local")
 
 def main():
     logger.info("Starting Schwab smoketest...")
