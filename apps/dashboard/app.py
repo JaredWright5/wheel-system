@@ -8,13 +8,17 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
-from dotenv import load_dotenv
+from pathlib import Path
 from loguru import logger
 
 from wheel.clients.supabase_client import select_all
 
-# Load environment variables
-load_dotenv(".env.local")
+# Load environment variables from .env.local if it exists (for local dev)
+# On Render, environment variables are provided directly
+env_file = Path(".env.local")
+if env_file.exists():
+    from dotenv import load_dotenv
+    load_dotenv(".env.local")
 
 app = FastAPI(title="Wheel System Dashboard v1")
 
