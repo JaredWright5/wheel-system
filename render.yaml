@@ -48,3 +48,13 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+
+  - type: cron
+    name: wheel-rsi-snapshot
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: PYTHONPATH=/opt/render/project/src python -m apps.worker.src.rsi_snapshot
+    schedule: "30 12 * * 1-5"  # Mon-Fri 4:30 AM PT (12:30 UTC during PST)
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
