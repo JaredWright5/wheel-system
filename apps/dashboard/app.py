@@ -38,7 +38,12 @@ def _safe_select(view_name: str, limit: int = 100) -> tuple[List[Dict[str, Any]]
         data = select_all(view_name, limit)
         return data, False
     except Exception as e:
-        logger.warning(f"Failed to query {view_name}: {e}")
+        # Log the full error for debugging
+        error_msg = str(e)
+        logger.error(f"Failed to query {view_name}: {error_msg}")
+        # Check if it's a "relation does not exist" error (view missing)
+        if "does not exist" in error_msg.lower() or "relation" in error_msg.lower():
+            logger.error(f"View {view_name} does not exist in database. Run migrations!")
         return [], True
 
 
