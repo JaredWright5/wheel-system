@@ -88,9 +88,11 @@ class AlphaVantageClient:
                 return None
             
             if "Note" in data:
-                # Rate limit message
-                logger.warning(f"Alpha Vantage RSI({symbol}) rate limited: {data['Note'][:200]}")
-                return None
+                # Rate limit message - raise exception so caller can detect it
+                note = data['Note']
+                logger.warning(f"Alpha Vantage RSI({symbol}) rate limited: {note[:200]}")
+                # Raise a specific exception for rate limiting so caller can handle it
+                raise RuntimeError(f"Alpha Vantage rate limit: {note[:200]}")
             
             # Extract RSI from Technical Analysis: RSI data
             rsi_data = data.get("Technical Analysis: RSI", {})

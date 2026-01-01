@@ -133,6 +133,12 @@ def main() -> None:
         fetched_missing = 0
         skipped_due_to_cache = 0
         inserted = 0
+        rate_limited = 0
+        stopped_due_to_limit = False
+        
+        # Alpha Vantage free tier: 25 requests per day
+        # Process max 24 per day to stay under limit (with some buffer)
+        MAX_REQUESTS_PER_DAY = 24
         
         # Fetch RSI for each ticker
         rows_to_upsert: List[Dict[str, Any]] = []
@@ -146,6 +152,12 @@ def main() -> None:
             if ticker in existing_tickers:
                 skipped_due_to_cache += 1
                 continue
+            
+            # Stop if we've hit the daily request limit
+            if fetched_ok + fetched_missing >= MAX_REQUESTS_PER_DAY:
+                stopped_due_to_limit = True
+                logger.info(f"Reached daily API limit ({MAX_REQUESTS_PER_DAY} requests). Stopping. Remaining tickers will be processed on subsequent days.")
+                break
             
             try:
                 # Fetch RSI from Alpha Vantage
@@ -175,8 +187,20 @@ def main() -> None:
                         "created_at": datetime.now(timezone.utc).isoformat(),
                     })
                     
-            except Exception as e:
+            except RuntimeError as e:
+                # Check if this is a rate limit error
+                error_str = str(e).lower()
+                if "rate limit" in error_str or "25 requests per day" in error_str:
+                    stopped_due_to_limit = True
+                    rate_limited += 1
+                    logger.warning(f"{ticker}: Alpha Vantage rate limit hit. Stopping after {fetched_ok + fetched_missing} requests.")
+                    break
+                # Other runtime errors
                 logger.warning(f"{ticker}: error fetching RSI: {e}")
+                fetched_missing += 1
+                continue
+            except Exception as e:
+                logger.warning(f"{ticker}: unexpected error fetching RSI: {e}")
                 fetched_missing += 1
                 continue
             
@@ -203,8 +227,17 @@ def main() -> None:
         logger.info(
             f"RSI snapshot complete: "
             f"fetched_ok={fetched_ok}, fetched_missing={fetched_missing}, "
-            f"skipped_due_to_cache={skipped_due_to_cache}, inserted={inserted}"
+            f"skipped_due_to_cache={skipped_due_to_cache}, rate_limited={rate_limited}, inserted={inserted}"
         )
+        if stopped_due_to_limit:
+            remaining = len(universe) - skipped_due_to_cache - fetched_ok - fetched_missing - rate_limited
+            logger.info(
+                f"Note: Stopped due to Alpha Vantage daily limit ({MAX_REQUESTS_PER_DAY} requests/day). "
+                f"Processed {fetched_ok + fetched_missing} tickers today. "
+                f"Approximately {remaining} tickers remaining. "
+                f"Remaining tickers will be processed on subsequent days. "
+                f"Consider upgrading to Alpha Vantage premium (75+ requests/day) for faster processing."
+            )
         
     except Exception as e:
         logger.exception(f"RSI snapshot failed: {e}")
