@@ -29,13 +29,17 @@ app.mount("/static", StaticFiles(directory="apps/dashboard/static"), name="stati
 templates = Jinja2Templates(directory="apps/dashboard/templates")
 
 
-def _safe_select(view_name: str, limit: int = 100) -> List[Dict[str, Any]]:
-    """Safe select that returns empty list if view doesn't exist."""
+def _safe_select(view_name: str, limit: int = 100) -> tuple[List[Dict[str, Any]], bool]:
+    """
+    Safe select that returns (data, has_error) tuple.
+    has_error is True if the query failed (view doesn't exist or other error).
+    """
     try:
-        return select_all(view_name, limit)
+        data = select_all(view_name, limit)
+        return data, False
     except Exception as e:
         logger.warning(f"Failed to query {view_name}: {e}")
-        return []
+        return [], True
 
 
 @app.get("/health")
@@ -73,11 +77,7 @@ def index(request: Request):
 @app.get("/runs", response_class=HTMLResponse)
 def runs(request: Request):
     """Run history page."""
-    runs_data = _safe_select("v_run_history", limit=200)
-    has_error = False
-    
-    # Try to detect if view exists by checking if we got any data or if there's a real error
-    # For now, we'll show empty table if no data (could be legitimately empty)
+    runs_data, has_error = _safe_select("v_run_history", limit=200)
     
     return templates.TemplateResponse(
         "runs.html",
@@ -92,14 +92,14 @@ def runs(request: Request):
 @app.get("/candidates", response_class=HTMLResponse)
 def candidates(request: Request):
     """Latest top 25 candidates page."""
-    candidates_data = _safe_select("v_latest_run_top25_candidates", limit=25)
+    candidates_data, has_error = _safe_select("v_latest_run_top25_candidates", limit=25)
     
     return templates.TemplateResponse(
         "candidates.html",
         {
             "request": request,
             "candidates": candidates_data,
-            "has_error": len(candidates_data) == 0,
+            "has_error": has_error,
         },
     )
 
@@ -107,8 +107,8 @@ def candidates(request: Request):
 @app.get("/picks", response_class=HTMLResponse)
 def picks(request: Request):
     """Picks page: CSP and CC picks."""
-    csp_picks = _safe_select("v_latest_run_csp_picks", limit=50)
-    cc_picks = _safe_select("v_latest_run_cc_picks", limit=50)
+    csp_picks, csp_error = _safe_select("v_latest_run_csp_picks", limit=50)
+    cc_picks, cc_error = _safe_select("v_latest_run_cc_picks", limit=50)
     
     return templates.TemplateResponse(
         "picks.html",
@@ -116,8 +116,8 @@ def picks(request: Request):
             "request": request,
             "csp_picks": csp_picks,
             "cc_picks": cc_picks,
-            "csp_error": len(csp_picks) == 0,
-            "cc_error": len(cc_picks) == 0,
+            "csp_error": csp_error,
+            "cc_error": cc_error,
         },
     )
 
