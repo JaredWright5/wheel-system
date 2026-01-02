@@ -18,6 +18,7 @@ from apps.worker.src.config.wheel_rules import (
     earnings_ok,
     find_expiration_in_window,
     is_within_dte_window,
+    spread_ok,
 )
 
 # Load environment variables from .env.local
@@ -31,10 +32,6 @@ RUN_ID = os.getenv("RUN_ID")  # None = use latest
 
 # Number of candidates to process (default 25)
 PICKS_N = int(os.getenv("PICKS_N", "25"))
-
-# Liquidity/spread filters (configurable via env)
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "2.5"))  # Max spread as % of mid price
-MIN_OPEN_INTEREST = int(os.getenv("MIN_OPEN_INTEREST", "50"))  # Minimum open interest
 
 
 # ---------- Helpers ----------
@@ -118,9 +115,9 @@ def _extract_put_options_for_exp(chain: Dict[str, Any], exp: date) -> List[Dict[
     return results
 
 
-def _check_liquidity(option: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+def _check_liquidity(option: Dict[str, Any], rules) -> Tuple[bool, Optional[str]]:
     """
-    Check if option meets liquidity requirements.
+    Check if option meets liquidity requirements using WheelRules.
     
     Returns:
         (is_valid, reason_if_invalid)
@@ -128,24 +125,38 @@ def _check_liquidity(option: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     bid = _safe_float(option.get("bid"), 0.0) or 0.0
     ask = _safe_float(option.get("ask"), 0.0) or 0.0
     
-    # Require non-null bid/ask
-    if bid <= 0 or ask <= 0:
-        return False, "missing_bid_ask"
+    # Require bid >= MIN_BID
+    if bid < rules.min_bid:
+        return False, f"bid_below_min_{bid:.2f}"
     
-    # Calculate spread
-    mid = (bid + ask) / 2.0
-    if mid <= 0:
-        return False, "invalid_mid"
+    # Require non-null ask
+    if ask <= 0:
+        return False, "missing_ask"
     
-    spread = ask - bid
-    spread_pct = (spread / mid) * 100.0
-    
-    if spread_pct > MAX_SPREAD_PCT:
-        return False, f"spread_too_wide_{spread_pct:.1f}%"
+    # Check spread using wheel_rules.spread_ok()
+    if not spread_ok(
+        bid=bid,
+        ask=ask,
+        max_spread_pct=rules.max_spread_pct,
+        max_abs_low=rules.max_abs_spread_low_premium,
+        max_abs_high=rules.max_abs_spread_high_premium,
+    ):
+        # Determine specific failure reason for logging
+        mid = (bid + ask) / 2.0
+        abs_spread = ask - bid
+        pct_spread = (abs_spread / mid) * 100.0 if mid > 0 else 0.0
+        max_abs = rules.max_abs_spread_low_premium if mid < 1.00 else rules.max_abs_spread_high_premium
+        
+        if pct_spread > rules.max_spread_pct:
+            return False, f"spread_pct_fail_{pct_spread:.1f}%"
+        elif abs_spread > max_abs:
+            return False, f"spread_abs_fail_{abs_spread:.2f}"
+        else:
+            return False, "spread_fail"
     
     # Check open interest
     oi = _safe_float(option.get("openInterest"), 0.0) or 0.0
-    if oi < MIN_OPEN_INTEREST:
+    if oi < rules.min_open_interest:
         return False, f"low_oi_{int(oi)}"
     
     return True, None
@@ -155,6 +166,7 @@ def _count_put_contracts_diagnostics(
     options: List[Dict[str, Any]],
     target_delta_low: float,
     target_delta_high: float,
+    rules,
 ) -> Dict[str, int]:
     """
     Count PUT contracts at each filtering stage for diagnostics.
@@ -182,25 +194,27 @@ def _count_put_contracts_diagnostics(
             if target_delta_low <= abs_delta <= target_delta_high:
                 counts["in_delta"] += 1
         
-        # Count bid > 0
+        # Count bid >= MIN_BID
         bid = _safe_float(o.get("bid"), 0.0) or 0.0
-        if bid > 0:
+        if bid >= rules.min_bid:
             counts["bid_ok"] += 1
             
-            # Count spread OK (only if bid > 0)
+            # Count spread OK (only if bid >= MIN_BID)
             ask = _safe_float(o.get("ask"), 0.0) or 0.0
             if ask > 0:
-                mid = (bid + ask) / 2.0
-                if mid > 0:
-                    spread = ask - bid
-                    spread_pct = (spread / mid) * 100.0
-                    if spread_pct <= MAX_SPREAD_PCT:
-                        counts["spread_ok"] += 1
-                        
-                        # Count OI OK (only if spread OK)
-                        oi = _safe_float(o.get("openInterest"), 0.0) or 0.0
-                        if oi >= MIN_OPEN_INTEREST:
-                            counts["oi_ok"] += 1
+                if spread_ok(
+                    bid=bid,
+                    ask=ask,
+                    max_spread_pct=rules.max_spread_pct,
+                    max_abs_low=rules.max_abs_spread_low_premium,
+                    max_abs_high=rules.max_abs_spread_high_premium,
+                ):
+                    counts["spread_ok"] += 1
+                    
+                    # Count OI OK (only if spread OK)
+                    oi = _safe_float(o.get("openInterest"), 0.0) or 0.0
+                    if oi >= rules.min_open_interest:
+                        counts["oi_ok"] += 1
     
     return counts
 
@@ -218,7 +232,7 @@ def _choose_best_put_in_delta_band(
     
     Requirements:
     - abs(delta) in [target_delta_low, target_delta_high]
-    - Passes liquidity checks (bid>0, spread, OI)
+    - Passes liquidity checks (bid >= MIN_BID, spread_ok, OI >= MIN_OPEN_INTEREST)
     - Maximizes annualized_yield = (premium / strike) * (365 / dte)
     """
     if not options:
@@ -241,7 +255,7 @@ def _choose_best_put_in_delta_band(
             continue
 
         # Check liquidity
-        is_liquid, liquidity_reason = _check_liquidity(o)
+        is_liquid, liquidity_reason = _check_liquidity(o, rules)
         if not is_liquid:
             continue  # Skip but don't log here (too verbose)
 
@@ -332,7 +346,10 @@ def main() -> None:
         f"DTE fallback=[{rules.dte_min_fallback}, {rules.dte_max_fallback}] "
         f"(allow_fallback={rules.allow_fallback_dte}), "
         f"earnings_avoid_days={rules.earnings_avoid_days}, "
-        f"liquidity: max_spread={MAX_SPREAD_PCT}%, min_oi={MIN_OPEN_INTEREST}"
+        f"liquidity: max_spread_pct={rules.max_spread_pct}%, "
+        f"min_bid=${rules.min_bid:.2f}, min_oi={rules.min_open_interest}, "
+        f"max_abs_spread_low=${rules.max_abs_spread_low_premium:.2f}, "
+        f"max_abs_spread_high=${rules.max_abs_spread_high_premium:.2f}"
     )
 
     sb = get_supabase()
@@ -481,6 +498,7 @@ def main() -> None:
                 puts,
                 target_delta_low=rules.csp_delta_min,
                 target_delta_high=rules.csp_delta_max,
+                rules=rules,
             )
 
             # Choose best PUT in delta band [CSP_DELTA_MIN, CSP_DELTA_MAX]
@@ -501,13 +519,13 @@ def main() -> None:
                     skip_reason = "delta out of band"
                 elif diag_counts["bid_ok"] == 0:
                     skipped_bid_zero += 1
-                    skip_reason = "no bid > 0"
+                    skip_reason = f"bid < ${rules.min_bid:.2f}"
                 elif diag_counts["spread_ok"] == 0:
                     skipped_spread += 1
-                    skip_reason = "spread too wide"
+                    skip_reason = "spread failed (pct or abs)"
                 elif diag_counts["oi_ok"] == 0:
                     skipped_open_interest += 1
-                    skip_reason = "low open interest"
+                    skip_reason = f"oi < {rules.min_open_interest}"
                 else:
                     # Fallback to generic delta skip if diagnostics don't clearly indicate
                     skipped_delta_out_of_band += 1
