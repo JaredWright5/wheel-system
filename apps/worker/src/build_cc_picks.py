@@ -308,14 +308,17 @@ def main() -> None:
 
     sb = get_supabase()
 
-    # 1) Determine run_id (env override or latest)
+    # 1) Determine run_id (env override or latest successful screening run)
     if RUN_ID:
         run_id = RUN_ID
         logger.info(f"Using RUN_ID from env: {run_id}")
     else:
+        # Get latest successful screening run (exclude daily tracker runs)
         runs = (
             sb.table("screening_runs")
-            .select("run_id, run_ts")
+            .select("run_id, run_ts, status, notes")
+            .eq("status", "success")
+            .neq("notes", "DAILY_TRACKER")
             .order("run_ts", desc=True)
             .limit(1)
             .execute()
@@ -323,9 +326,9 @@ def main() -> None:
             or []
         )
         if not runs:
-            raise RuntimeError("No screening_runs found. Run weekly_screener first.")
+            raise RuntimeError("No successful screening_runs found. Run weekly_screener first.")
         run_id = runs[0]["run_id"]
-        logger.info(f"Using latest run_id: {run_id}")
+        logger.info(f"Using latest successful screening run_id: {run_id} (run_ts={runs[0].get('run_ts')})")
 
     # 2) Get eligible positions (test mode or real positions)
     eligible_positions: List[Dict[str, Any]] = []
