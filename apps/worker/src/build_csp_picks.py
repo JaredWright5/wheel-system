@@ -1,6 +1,7 @@
 """
 Build CSP (Cash-Secured Put) picks from screening candidates.
 Uses WheelRules for consistent configuration and applies earnings exclusion.
+Enhanced with diagnostic logging for pick generation failures.
 """
 from __future__ import annotations
 
@@ -148,6 +149,60 @@ def _check_liquidity(option: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         return False, f"low_oi_{int(oi)}"
     
     return True, None
+
+
+def _count_put_contracts_diagnostics(
+    options: List[Dict[str, Any]],
+    target_delta_low: float,
+    target_delta_high: float,
+) -> Dict[str, int]:
+    """
+    Count PUT contracts at each filtering stage for diagnostics.
+    
+    Returns:
+        Dictionary with counts: puts_total, delta_present, in_delta, bid_ok, spread_ok, oi_ok
+    """
+    counts = {
+        "puts_total": len(options),
+        "delta_present": 0,
+        "in_delta": 0,
+        "bid_ok": 0,
+        "spread_ok": 0,
+        "oi_ok": 0,
+    }
+    
+    for o in options:
+        # Count delta present
+        d = _safe_float(o.get("delta"))
+        if d is not None:
+            counts["delta_present"] += 1
+            abs_delta = abs(d)
+            
+            # Count in delta band
+            if target_delta_low <= abs_delta <= target_delta_high:
+                counts["in_delta"] += 1
+        
+        # Count bid > 0
+        bid = _safe_float(o.get("bid"), 0.0) or 0.0
+        if bid > 0:
+            counts["bid_ok"] += 1
+            
+            # Count spread OK (only if bid > 0)
+            ask = _safe_float(o.get("ask"), 0.0) or 0.0
+            if ask > 0:
+                mid = (bid + ask) / 2.0
+                if mid > 0:
+                    spread = ask - bid
+                    spread_pct = (spread / mid) * 100.0
+                    if spread_pct <= MAX_SPREAD_PCT:
+                        counts["spread_ok"] += 1
+                        
+                        # Count OI OK (only if spread OK)
+                        oi = _safe_float(o.get("openInterest"), 0.0) or 0.0
+                        if oi >= MIN_OPEN_INTEREST:
+                            counts["oi_ok"] += 1
+    
+    return counts
 
 
 def _choose_best_put_in_delta_band(
@@ -345,8 +400,11 @@ def main() -> None:
     skipped_earnings_blocked = 0
     skipped_no_chain = 0
     skipped_no_contract_in_dte = 0
-    skipped_no_contract_in_delta = 0
-    skipped_liquidity_failed = 0
+    skipped_delta_missing = 0
+    skipped_delta_out_of_band = 0
+    skipped_bid_zero = 0
+    skipped_spread = 0
+    skipped_open_interest = 0
 
     now = datetime.now(timezone.utc).date()
 
@@ -414,9 +472,16 @@ def main() -> None:
             # Extract PUT options for this expiration
             puts = _extract_put_options_for_exp(chain, exp)
             if not puts:
-                skipped_no_contract_in_delta += 1
+                skipped_delta_missing += 1  # No contracts at all
                 logger.warning(f"{ticker}: no PUTs extracted for exp={exp}")
                 continue
+
+            # Count diagnostics BEFORE filtering
+            diag_counts = _count_put_contracts_diagnostics(
+                puts,
+                target_delta_low=rules.csp_delta_min,
+                target_delta_high=rules.csp_delta_max,
+            )
 
             # Choose best PUT in delta band [CSP_DELTA_MIN, CSP_DELTA_MAX]
             best = _choose_best_put_in_delta_band(
@@ -427,14 +492,43 @@ def main() -> None:
                 rules=rules,
             )
             if not best:
-                # Check if it's a delta issue or liquidity issue
-                # (We can't easily distinguish here, so count as delta issue)
-                skipped_no_contract_in_delta += 1
-                logger.warning(
-                    f"{ticker}: no PUTs in delta band "
-                    f"[{rules.csp_delta_min:.2f}, {rules.csp_delta_max:.2f}] "
-                    f"with liquidity (bid>0, spread<{MAX_SPREAD_PCT}%, oi>={MIN_OPEN_INTEREST})"
+                # Determine which filter failed based on diagnostics
+                if diag_counts["delta_present"] == 0:
+                    skipped_delta_missing += 1
+                    skip_reason = "delta missing from Schwab"
+                elif diag_counts["in_delta"] == 0:
+                    skipped_delta_out_of_band += 1
+                    skip_reason = "delta out of band"
+                elif diag_counts["bid_ok"] == 0:
+                    skipped_bid_zero += 1
+                    skip_reason = "no bid > 0"
+                elif diag_counts["spread_ok"] == 0:
+                    skipped_spread += 1
+                    skip_reason = "spread too wide"
+                elif diag_counts["oi_ok"] == 0:
+                    skipped_open_interest += 1
+                    skip_reason = "low open interest"
+                else:
+                    # Fallback to generic delta skip if diagnostics don't clearly indicate
+                    skipped_delta_out_of_band += 1
+                    skip_reason = "other"
+                
+                # Log ONE warning line with diagnostics
+                log_msg = (
+                    f"{ticker}: no pick | "
+                    f"puts_total={diag_counts['puts_total']} "
+                    f"delta_present={diag_counts['delta_present']} "
+                    f"in_delta={diag_counts['in_delta']} "
+                    f"bid_ok={diag_counts['bid_ok']} "
+                    f"spread_ok={diag_counts['spread_ok']} "
+                    f"oi_ok={diag_counts['oi_ok']}"
                 )
+                if diag_counts["delta_present"] == 0:
+                    log_msg += " (delta missing from Schwab)"
+                else:
+                    log_msg += f" | reason={skip_reason}"
+                
+                logger.warning(log_msg)
                 continue
 
             # Extract values
@@ -520,8 +614,11 @@ def main() -> None:
         f"skipped_earnings_blocked={skipped_earnings_blocked}, "
         f"skipped_no_chain={skipped_no_chain}, "
         f"skipped_no_contract_in_dte={skipped_no_contract_in_dte}, "
-        f"skipped_no_contract_in_delta={skipped_no_contract_in_delta}, "
-        f"skipped_liquidity_failed={skipped_liquidity_failed}"
+        f"skipped_delta_missing={skipped_delta_missing}, "
+        f"skipped_delta_out_of_band={skipped_delta_out_of_band}, "
+        f"skipped_bid_zero={skipped_bid_zero}, "
+        f"skipped_spread={skipped_spread}, "
+        f"skipped_open_interest={skipped_open_interest}"
     )
 
     if not pick_rows:
