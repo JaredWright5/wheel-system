@@ -36,6 +36,8 @@ from screening_candidates sc
 where sc.run_id = (
     select run_id
     from screening_runs
+    where status = 'success'
+      and notes != 'DAILY_TRACKER'
     order by run_ts desc
     limit 1
 )
@@ -107,6 +109,8 @@ from screening_picks sp
 where sp.run_id = (
     select run_id
     from screening_runs
+    where status = 'success'
+      and notes != 'DAILY_TRACKER'
     order by run_ts desc
     limit 1
 )
