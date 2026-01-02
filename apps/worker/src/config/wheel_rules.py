@@ -389,7 +389,7 @@ if __name__ == "__main__":
         (0.50, 0.57, False), # 14% spread - should fail pct check
         (0.50, 0.58, False), # 16% spread - should fail pct check
         (0.45, 0.55, False), # 20% spread, $0.10 abs - should fail pct check
-        (1.0, 1.08, True),   # 8% spread, $0.08 abs - should pass
+        (1.0, 1.08, False),  # 7.7% spread, $0.08 abs - should fail (7.7% > 7.5%)
         (2.0, 2.15, True),   # 7.5% spread, $0.15 abs - should pass
         (2.0, 2.26, False),  # 13% spread, $0.26 abs - should fail pct check
     ]
