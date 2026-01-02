@@ -251,14 +251,17 @@ def main() -> None:
 
     sb = get_supabase()
 
-    # 1) Determine run_id (env override or latest)
+    # 1) Determine run_id (env override or latest successful screening run)
     if RUN_ID:
         run_id = RUN_ID
         logger.info(f"Using RUN_ID from env: {run_id}")
     else:
+        # Get latest successful screening run (exclude daily tracker runs)
         runs = (
             sb.table("screening_runs")
-            .select("run_id, run_ts")
+            .select("run_id, run_ts, status, notes")
+            .eq("status", "success")
+            .neq("notes", "DAILY_TRACKER")
             .order("run_ts", desc=True)
             .limit(1)
             .execute()
@@ -266,9 +269,9 @@ def main() -> None:
             or []
         )
         if not runs:
-            raise RuntimeError("No screening_runs found. Run weekly_screener first.")
+            raise RuntimeError("No successful screening_runs found. Run weekly_screener first.")
         run_id = runs[0]["run_id"]
-        logger.info(f"Using latest run_id: {run_id}")
+        logger.info(f"Using latest successful screening run_id: {run_id} (run_ts={runs[0].get('run_ts')})")
 
     # 2) Get top candidates for that run
     cands = (
@@ -282,7 +285,24 @@ def main() -> None:
         or []
     )
     if not cands:
-        raise RuntimeError(f"No screening_candidates found for run_id={run_id}")
+        # Provide more helpful error message
+        run_check = (
+            sb.table("screening_runs")
+            .select("status, notes, candidates_count, run_ts")
+            .eq("run_id", run_id)
+            .execute()
+            .data
+        )
+        if run_check:
+            run_info = run_check[0]
+            raise RuntimeError(
+                f"No screening_candidates found for run_id={run_id}. "
+                f"Run status: {run_info.get('status')}, notes: {run_info.get('notes')}, "
+                f"candidates_count: {run_info.get('candidates_count')}, run_ts: {run_info.get('run_ts')}. "
+                f"Make sure weekly_screener completed successfully for this run."
+            )
+        else:
+            raise RuntimeError(f"Run_id {run_id} not found in screening_runs table.")
 
     logger.info(f"Processing {len(cands)} candidates for run_id={run_id}")
 
