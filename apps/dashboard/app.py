@@ -72,9 +72,9 @@ def index(request: Request):
             "csp_picks": csp_picks,
             "cc_picks": cc_picks,
             "latest_run": latest_run,
-            "candidates_error": candidates_error or (len(candidates) == 0 and len(runs) > 0),
-            "csp_error": csp_error or (len(csp_picks) == 0 and len(runs) > 0),
-            "cc_error": cc_error or (len(cc_picks) == 0 and len(runs) > 0),
+            "candidates_error": candidates_error,  # Only show error if view doesn't exist
+            "csp_error": csp_error,  # Only show error if view doesn't exist
+            "cc_error": cc_error,  # Only show error if view doesn't exist
         },
     )
 
