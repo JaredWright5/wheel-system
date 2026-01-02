@@ -56,10 +56,10 @@ def health():
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     """Home page: summary with latest candidates, CSP picks, and CC picks."""
-    candidates = _safe_select("v_latest_run_top25_candidates", limit=25)
-    csp_picks = _safe_select("v_latest_run_csp_picks", limit=50)
-    cc_picks = _safe_select("v_latest_run_cc_picks", limit=50)
-    runs = _safe_select("v_run_history", limit=5)  # Latest 5 runs for summary
+    candidates, candidates_error = _safe_select("v_latest_run_top25_candidates", limit=25)
+    csp_picks, csp_error = _safe_select("v_latest_run_csp_picks", limit=50)
+    cc_picks, cc_error = _safe_select("v_latest_run_cc_picks", limit=50)
+    runs, runs_error = _safe_select("v_run_history", limit=5)  # Latest 5 runs for summary
     
     # Get latest run info
     latest_run = runs[0] if runs else None
@@ -72,9 +72,9 @@ def index(request: Request):
             "csp_picks": csp_picks,
             "cc_picks": cc_picks,
             "latest_run": latest_run,
-            "candidates_error": len(candidates) == 0 and len(runs) > 0,
-            "csp_error": len(csp_picks) == 0 and len(runs) > 0,
-            "cc_error": len(cc_picks) == 0 and len(runs) > 0,
+            "candidates_error": candidates_error or (len(candidates) == 0 and len(runs) > 0),
+            "csp_error": csp_error or (len(csp_picks) == 0 and len(runs) > 0),
+            "cc_error": cc_error or (len(cc_picks) == 0 and len(runs) > 0),
         },
     )
 
