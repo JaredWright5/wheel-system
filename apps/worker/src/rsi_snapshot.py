@@ -204,10 +204,26 @@ def main() -> None:
         # Insert remaining rows
         if rows_to_upsert:
             try:
-                upsert_rows("rsi_snapshots", rows_to_upsert, keys=["ticker", "as_of_date", "interval", "period"])
-                inserted += len(rows_to_upsert)
+                # Deduplicate final batch (in case of any duplicates)
+                seen_keys = set()
+                deduped_rows = []
+                for row in rows_to_upsert:
+                    key = (row["ticker"], row["as_of_date"], row["interval"], row["period"])
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        deduped_rows.append(row)
+                
+                if deduped_rows:
+                    upsert_rows("rsi_snapshots", deduped_rows, keys=["ticker", "as_of_date", "interval", "period"])
+                    inserted += len(deduped_rows)
+                    if len(deduped_rows) < len(rows_to_upsert):
+                        logger.warning(f"Deduplicated final batch: {len(rows_to_upsert)} -> {len(deduped_rows)} rows")
             except Exception as e:
                 logger.error(f"Error upserting final RSI snapshots batch: {e}")
+                # Log the problematic rows for debugging
+                if "duplicate key" in str(e).lower():
+                    tickers_in_batch = [r["ticker"] for r in rows_to_upsert]
+                    logger.error(f"Duplicate key error. Tickers in final batch: {tickers_in_batch}")
         
         # Log summary
         logger.info(
