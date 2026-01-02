@@ -1,11 +1,12 @@
 """
 Weekly Screener v2: FMP Stable Universe + Enrichment
 Uses FMP stable endpoints for universe building, fundamentals, technicals, and sentiment.
+Integrates with WheelRules for configurable trading parameters.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 import csv
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -19,6 +20,7 @@ BUILD_SHA = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "local"
 
 from wheel.clients.fmp_stable_client import FMPStableClient, simple_sentiment_score
 from wheel.clients.supabase_client import insert_row, upsert_rows, update_rows, get_supabase
+from apps.worker.src.config.wheel_rules import load_wheel_rules
 
 
 @dataclass
@@ -31,6 +33,7 @@ class Candidate:
     price: Optional[float]
     beta: Optional[float]
     rsi: Optional[float]
+    earnings_in_days: Optional[int]
     fundamentals_score: int
     sentiment_score: int
     trend_score: int
@@ -220,8 +223,8 @@ def score_trend_proxy(quote: Dict[str, Any]) -> tuple[int, Dict[str, Any]]:
 
 def get_rsi_from_cache(
     ticker: str,
-    interval: str = "daily",
-    period: int = 14,
+    interval: str,
+    period: int,
     max_age_hours: int = 24,
 ) -> Optional[float]:
     """
@@ -230,8 +233,8 @@ def get_rsi_from_cache(
     
     Args:
         ticker: Stock symbol
-        interval: RSI interval (default "daily")
-        period: RSI period (default 14)
+        interval: RSI interval (e.g., "1day")
+        period: RSI period (e.g., 14)
         max_age_hours: Maximum age in hours for cached RSI (default 24)
         
     Returns:
@@ -268,12 +271,13 @@ def score_technical(rsi: Optional[float]) -> int:
     """
     Score based on RSI (technical sanity).
     Prefer RSI in reasonable range (30-70).
+    Missing RSI is treated as neutral (50 points).
     
     Returns:
-        Score 0-100 (100 = ideal RSI, 0 = extreme)
+        Score 0-100 (100 = ideal RSI, 50 = neutral/missing, 0 = extreme)
     """
     if rsi is None:
-        return 50  # Neutral if missing
+        return 50  # Neutral if missing (soft score, no penalty)
     
     # Ideal range: 30-70 (score = 100)
     # Outside range: score decreases
@@ -287,10 +291,58 @@ def score_technical(rsi: Optional[float]) -> int:
         return clamp_int(100 * ((100 - rsi) / 30.0), 0, 100)
 
 
+def calculate_earnings_in_days(earnings_date_str: Optional[str]) -> Optional[int]:
+    """
+    Calculate days until earnings from earnings date string.
+    
+    Args:
+        earnings_date_str: Earnings date as ISO string (YYYY-MM-DD) or None
+        
+    Returns:
+        Days until earnings (int) if earnings_date_str is valid and in future, None otherwise
+    """
+    if not earnings_date_str:
+        return None
+    
+    try:
+        # Parse date string (handle various formats)
+        if isinstance(earnings_date_str, str):
+            # Try ISO format first
+            if "T" in earnings_date_str:
+                earnings_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
+            else:
+                earnings_date = date.fromisoformat(earnings_date_str[:10])
+        else:
+            return None
+        
+        today = datetime.now(timezone.utc).date()
+        
+        # Only return positive days (future earnings)
+        if earnings_date > today:
+            return (earnings_date - today).days
+        else:
+            return None  # Earnings in past or today
+    except Exception as e:
+        logger.debug(f"Error parsing earnings date '{earnings_date_str}': {e}")
+        return None
+
+
 def main() -> None:
     run_id: Optional[str] = None
     
     try:
+        # Load wheel rules configuration
+        rules = load_wheel_rules()
+        logger.info(
+            f"Wheel rules in effect: "
+            f"CSP delta=[{rules.csp_delta_min:.2f}, {rules.csp_delta_max:.2f}], "
+            f"CC delta=[{rules.cc_delta_min:.2f}, {rules.cc_delta_max:.2f}], "
+            f"DTE primary=[{rules.dte_min_primary}, {rules.dte_max_primary}], "
+            f"DTE fallback=[{rules.dte_min_fallback}, {rules.dte_max_fallback}], "
+            f"earnings_avoid_days={rules.earnings_avoid_days}, "
+            f"RSI(period={rules.rsi_period}, interval={rules.rsi_interval})"
+        )
+        
         # Initialize FMP stable client
         fmp = FMPStableClient()
         logger.info(f"Build SHA: {BUILD_SHA}")
@@ -301,10 +353,6 @@ def main() -> None:
         MIN_PRICE = float(os.getenv("MIN_PRICE", "5.0"))
         MIN_MARKET_CAP = int(os.getenv("MIN_MARKET_CAP", "2000000000"))  # $2B default
         MIN_AVG_VOLUME = int(os.getenv("MIN_AVG_VOLUME", "1000000")) if os.getenv("MIN_AVG_VOLUME") else None
-        RSI_MIN = float(os.getenv("RSI_MIN", "30"))
-        RSI_MAX = float(os.getenv("RSI_MAX", "70"))
-        RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-        RSI_INTERVAL = os.getenv("RSI_INTERVAL", "daily")
         RSI_MAX_AGE_HOURS = int(os.getenv("RSI_MAX_AGE_HOURS", "24"))
         
         # Build universe
@@ -341,7 +389,6 @@ def main() -> None:
         mcap_filtered = 0
         price_filtered = 0
         rsi_missing = 0
-        rsi_filtered = 0
         passed_all_filters = 0
         
         for item in universe:
@@ -357,8 +404,13 @@ def main() -> None:
                 metrics = fmp.key_metrics_ttm(t) or {}
                 news = fmp.stock_news(t, limit=50)
                 
-                # Get RSI from Supabase cache (populated by rsi_snapshot.py worker)
-                rsi = get_rsi_from_cache(t, interval=RSI_INTERVAL, period=RSI_PERIOD, max_age_hours=RSI_MAX_AGE_HOURS)
+                # Get RSI from Supabase cache using wheel rules parameters
+                rsi = get_rsi_from_cache(
+                    t,
+                    interval=rules.rsi_interval,
+                    period=rules.rsi_period,
+                    max_age_hours=RSI_MAX_AGE_HOURS
+                )
                 
                 # Track missing data
                 if not profile:
@@ -370,6 +422,12 @@ def main() -> None:
                 price = quote.get("price")
                 market_cap = profile.get("mktCap") or quote.get("marketCap") or profile.get("marketCap")
                 beta = profile.get("beta") or quote.get("beta")
+                
+                # Extract earnings date (if available in profile)
+                earnings_date_str = profile.get("lastDivDate") or profile.get("exDividendDate") or profile.get("nextDividendDate")
+                # Note: FMP profile may not have earnings date; we try best-effort extraction
+                # Earnings calendar endpoint would be ideal but may require premium
+                earnings_in_days = calculate_earnings_in_days(earnings_date_str)
                 
                 # Filter: price required
                 if price is None or price <= 0:
@@ -389,13 +447,10 @@ def main() -> None:
                     price_filtered += 1
                     continue
                 
-                # Filter: RSI gate (optional, don't drop if missing)
+                # RSI is NOT a hard filter - track missing but don't exclude
                 if rsi is None:
                     rsi_missing += 1
-                    # Don't filter - just log
-                elif rsi < RSI_MIN or rsi > RSI_MAX:
-                    rsi_filtered += 1
-                    continue
+                    # Continue processing (RSI missing is OK, treated as neutral in scoring)
                 
                 passed_all_filters += 1
                 
@@ -406,14 +461,14 @@ def main() -> None:
                 # Compute scores
                 f_score, f_feats = score_fundamentals(ratios, metrics)
                 trend_score, t_feats = score_trend_proxy(quote)
-                tech_score = score_technical(rsi)
+                tech_score = score_technical(rsi)  # RSI contributes as soft score (10% weight)
                 
                 # Composite wheel score (weighted)
                 wheel_score = clamp_int(
                     0.50 * f_score +      # Fundamentals: 50%
                     0.20 * sent_score +   # Sentiment: 20%
                     0.20 * trend_score +  # Trend: 20%
-                    0.10 * tech_score,    # Technical: 10%
+                    0.10 * tech_score,    # Technical (RSI): 10% - soft score, missing RSI = neutral
                     0, 100
                 )
                 
@@ -426,8 +481,9 @@ def main() -> None:
                 reasons = {
                     "market_cap_min": MIN_MARKET_CAP,
                     "price_min": MIN_PRICE,
-                    "rsi_min": RSI_MIN,
-                    "rsi_max": RSI_MAX,
+                    "rsi_period": rules.rsi_period,
+                    "rsi_interval": rules.rsi_interval,
+                    "rsi_missing": rsi is None,
                     "notes": "IV sourced from Schwab in pick builder; weekly_screener does not require IV to run"
                 }
                 
@@ -438,6 +494,9 @@ def main() -> None:
                     "ratios": ratios,
                     "metrics": metrics,
                     "rsi": rsi,
+                    "rsi_period": rules.rsi_period,
+                    "rsi_interval": rules.rsi_interval,
+                    "earnings_in_days": earnings_in_days,
                     "news_count": len(news),
                     "sentiment_raw": sent,
                     "fundamentals": f_feats,
@@ -453,6 +512,7 @@ def main() -> None:
                     price=float(price),
                     beta=float(beta) if beta is not None else None,
                     rsi=rsi,
+                    earnings_in_days=earnings_in_days,
                     fundamentals_score=f_score,
                     sentiment_score=sent_score,
                     trend_score=trend_score,
@@ -484,8 +544,7 @@ def main() -> None:
             f"Filter stats: prof_missing={prof_missing}, quote_missing={quote_missing}, "
             f"price_missing={price_missing}, mcap_missing={mcap_missing}, "
             f"mcap_filtered={mcap_filtered}, price_filtered={price_filtered}, "
-            f"rsi_missing={rsi_missing}, rsi_filtered={rsi_filtered}, "
-            f"passed_all_filters={passed_all_filters}"
+            f"rsi_missing={rsi_missing}, passed_all_filters={passed_all_filters}"
         )
         
         # Upsert tickers
@@ -506,6 +565,9 @@ def main() -> None:
                 "sentiment_score": c.sentiment_score,
                 "trend_score": c.trend_score,
                 "technical_score": c.technical_score,
+                "rsi_period": rules.rsi_period,
+                "rsi_interval": rules.rsi_interval,
+                "earnings_in_days": c.earnings_in_days,
                 "reasons": c.reasons,
                 "features": c.features,  # Full raw data dump
             }
@@ -523,9 +585,9 @@ def main() -> None:
                 "iv_rank": None,  # IV rank computed from Schwab + history
                 "beta": c.beta,
                 "rsi": c.rsi,
-                "earn_in_days": None,  # TODO: Add earnings calendar logic
+                "earn_in_days": c.earnings_in_days,  # Write to explicit column
                 "sentiment_score": c.sentiment_score,
-                "metrics": metrics,
+                "metrics": metrics,  # Also store in JSONB for redundancy
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             })
         
