@@ -347,7 +347,7 @@ def main() -> None:
         f"earnings_avoid_days={rules.earnings_avoid_days}, "
         f"liquidity: max_spread_pct={rules.max_spread_pct}%, "
         f"min_bid=${rules.min_bid:.2f}, min_oi={rules.min_open_interest}, "
-        f"max_abs_spread_low=${rules.max_abs_spread_high_premium:.2f}, "
+        f"max_abs_spread_low=${rules.max_abs_spread_low_premium:.2f}, "
         f"max_abs_spread_high=${rules.max_abs_spread_high_premium:.2f}"
     )
 
