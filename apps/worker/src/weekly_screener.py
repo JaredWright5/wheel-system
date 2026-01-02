@@ -21,6 +21,7 @@ BUILD_SHA = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "local"
 from wheel.clients.fmp_stable_client import FMPStableClient, simple_sentiment_score
 from wheel.clients.supabase_client import insert_row, upsert_rows, update_rows, get_supabase
 from apps.worker.src.config.wheel_rules import load_wheel_rules
+from apps.worker.src.utils.symbols import normalize_for_fmp
 
 
 @dataclass
@@ -317,7 +318,8 @@ def fetch_earnings_date(
         # FMP stable earnings calendar endpoint (if available)
         # Format: /stable/earnings-calendar?symbol=AAPL or similar
         # We'll try a generic approach
-        earnings_cal = fmp._get("earnings-calendar", params={"symbol": ticker})
+        normalized_ticker = normalize_for_fmp(ticker)
+        earnings_cal = fmp._get("earnings-calendar", params={"symbol": normalized_ticker})
         if earnings_cal:
             if isinstance(earnings_cal, list) and earnings_cal:
                 # Find next future earnings date
