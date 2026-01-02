@@ -15,7 +15,6 @@ import os
 # Load environment variables
 load_dotenv(".env.local")
 
-from wheel.clients.alpha_vantage_client import AlphaVantageClient
 from wheel.clients.fmp_stable_client import FMPStableClient
 from wheel.clients.supabase_client import get_supabase, upsert_rows
 
@@ -97,9 +96,9 @@ def build_universe_fmp_stable(
 
 def main() -> None:
     try:
-        # Initialize clients
-        av = AlphaVantageClient()
-        logger.info("Alpha Vantage client initialized")
+        # Initialize FMP client (RSI is included in subscription)
+        fmp = FMPStableClient()
+        logger.info("FMP Stable client initialized (RSI included)")
         
         # Environment variables
         universe_source = os.getenv("UNIVERSE_SOURCE", "csv").lower()
@@ -114,7 +113,6 @@ def main() -> None:
             universe = load_universe_csv("data/universe_us.csv")
             logger.info(f"Universe size from CSV: {len(universe)} (source=csv)")
         else:
-            fmp = FMPStableClient()
             universe = build_universe_fmp_stable(fmp, MIN_PRICE, MIN_MARKET_CAP, MIN_AVG_VOLUME)
             logger.info(f"Universe size from FMP stable: {len(universe)} (source=fmp_stable)")
         
@@ -133,12 +131,6 @@ def main() -> None:
         fetched_missing = 0
         skipped_due_to_cache = 0
         inserted = 0
-        rate_limited = 0
-        stopped_due_to_limit = False
-        
-        # Alpha Vantage free tier: 25 requests per day
-        # Process max 24 per day to stay under limit (with some buffer)
-        MAX_REQUESTS_PER_DAY = 24
         
         # Fetch RSI for each ticker
         rows_to_upsert: List[Dict[str, Any]] = []
@@ -153,15 +145,9 @@ def main() -> None:
                 skipped_due_to_cache += 1
                 continue
             
-            # Stop if we've hit the daily request limit
-            if fetched_ok + fetched_missing >= MAX_REQUESTS_PER_DAY:
-                stopped_due_to_limit = True
-                logger.info(f"Reached daily API limit ({MAX_REQUESTS_PER_DAY} requests). Stopping. Remaining tickers will be processed on subsequent days.")
-                break
-            
             try:
-                # Fetch RSI from Alpha Vantage
-                rsi = av.get_rsi(ticker, interval=RSI_INTERVAL, period=RSI_PERIOD)
+                # Fetch RSI from FMP (included in subscription)
+                rsi = fmp.technical_indicator_rsi(ticker, period=RSI_PERIOD, interval=RSI_INTERVAL)
                 
                 if rsi is not None:
                     fetched_ok += 1
@@ -171,7 +157,7 @@ def main() -> None:
                         "interval": RSI_INTERVAL,
                         "period": RSI_PERIOD,
                         "rsi": float(rsi),
-                        "source": "alpha_vantage",
+                        "source": "fmp",
                         "created_at": datetime.now(timezone.utc).isoformat(),
                     })
                 else:
@@ -183,24 +169,12 @@ def main() -> None:
                         "interval": RSI_INTERVAL,
                         "period": RSI_PERIOD,
                         "rsi": None,
-                        "source": "alpha_vantage",
+                        "source": "fmp",
                         "created_at": datetime.now(timezone.utc).isoformat(),
                     })
                     
-            except RuntimeError as e:
-                # Check if this is a rate limit error
-                error_str = str(e).lower()
-                if "rate limit" in error_str or "25 requests per day" in error_str:
-                    stopped_due_to_limit = True
-                    rate_limited += 1
-                    logger.warning(f"{ticker}: Alpha Vantage rate limit hit. Stopping after {fetched_ok + fetched_missing} requests.")
-                    break
-                # Other runtime errors
-                logger.warning(f"{ticker}: error fetching RSI: {e}")
-                fetched_missing += 1
-                continue
             except Exception as e:
-                logger.warning(f"{ticker}: unexpected error fetching RSI: {e}")
+                logger.warning(f"{ticker}: error fetching RSI: {e}")
                 fetched_missing += 1
                 continue
             
@@ -227,17 +201,8 @@ def main() -> None:
         logger.info(
             f"RSI snapshot complete: "
             f"fetched_ok={fetched_ok}, fetched_missing={fetched_missing}, "
-            f"skipped_due_to_cache={skipped_due_to_cache}, rate_limited={rate_limited}, inserted={inserted}"
+            f"skipped_due_to_cache={skipped_due_to_cache}, inserted={inserted}"
         )
-        if stopped_due_to_limit:
-            remaining = len(universe) - skipped_due_to_cache - fetched_ok - fetched_missing - rate_limited
-            logger.info(
-                f"Note: Stopped due to Alpha Vantage daily limit ({MAX_REQUESTS_PER_DAY} requests/day). "
-                f"Processed {fetched_ok + fetched_missing} tickers today. "
-                f"Approximately {remaining} tickers remaining. "
-                f"Remaining tickers will be processed on subsequent days. "
-                f"Consider upgrading to Alpha Vantage premium (75+ requests/day) for faster processing."
-            )
         
     except Exception as e:
         logger.exception(f"RSI snapshot failed: {e}")
