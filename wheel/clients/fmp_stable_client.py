@@ -11,6 +11,15 @@ import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from loguru import logger
 
+# Import symbol normalization utility
+try:
+    from apps.worker.src.utils.symbols import normalize_for_fmp
+except ImportError:
+    # Fallback if import fails (e.g., in some environments)
+    def normalize_for_fmp(symbol: str) -> str:
+        """Fallback: return symbol as-is if utils module not available."""
+        return symbol
+
 BASE_URL = "https://financialmodelingprep.com/stable"
 VERSION = "fmp_stable_v1"
 
@@ -135,6 +144,8 @@ class FMPStableClient:
         Returns:
             Dictionary with profile data, or {} if not found
         """
+        original_symbol = symbol
+        symbol = normalize_for_fmp(symbol)
         try:
             data = self._get("profile", params={"symbol": symbol})
             if isinstance(data, list) and data:
@@ -145,10 +156,10 @@ class FMPStableClient:
         except requests.HTTPError as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 404:
                 return {}
-            logger.warning(f"FMP profile({symbol}) failed: {e}")
+            logger.warning(f"FMP profile({original_symbol} -> {symbol}) failed: {e}")
             return {}
         except Exception as e:
-            logger.warning(f"FMP profile({symbol}) unexpected error: {e}")
+            logger.warning(f"FMP profile({original_symbol} -> {symbol}) unexpected error: {e}")
             return {}
 
     @retry(
@@ -166,6 +177,8 @@ class FMPStableClient:
         Returns:
             Dictionary with quote data, or {} if not found
         """
+        original_symbol = symbol
+        symbol = normalize_for_fmp(symbol)
         try:
             data = self._get("quote", params={"symbol": symbol})
             if isinstance(data, list) and data:
@@ -176,10 +189,10 @@ class FMPStableClient:
         except requests.HTTPError as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 404:
                 return {}
-            logger.warning(f"FMP quote({symbol}) failed: {e}")
+            logger.warning(f"FMP quote({original_symbol} -> {symbol}) failed: {e}")
             return {}
         except Exception as e:
-            logger.warning(f"FMP quote({symbol}) unexpected error: {e}")
+            logger.warning(f"FMP quote({original_symbol} -> {symbol}) unexpected error: {e}")
             return {}
 
     @retry(
@@ -197,6 +210,8 @@ class FMPStableClient:
         Returns:
             Dictionary with metrics, or {} if not found
         """
+        original_symbol = symbol
+        symbol = normalize_for_fmp(symbol)
         try:
             data = self._get("key-metrics-ttm", params={"symbol": symbol})
             if isinstance(data, list) and data:
@@ -207,10 +222,10 @@ class FMPStableClient:
         except requests.HTTPError as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 404:
                 return {}
-            logger.warning(f"FMP key_metrics_ttm({symbol}) failed: {e}")
+            logger.warning(f"FMP key_metrics_ttm({original_symbol} -> {symbol}) failed: {e}")
             return {}
         except Exception as e:
-            logger.warning(f"FMP key_metrics_ttm({symbol}) unexpected error: {e}")
+            logger.warning(f"FMP key_metrics_ttm({original_symbol} -> {symbol}) unexpected error: {e}")
             return {}
 
     @retry(
@@ -228,6 +243,8 @@ class FMPStableClient:
         Returns:
             Dictionary with ratios, or {} if not found
         """
+        original_symbol = symbol
+        symbol = normalize_for_fmp(symbol)
         try:
             data = self._get("ratios-ttm", params={"symbol": symbol})
             if isinstance(data, list) and data:
@@ -238,10 +255,10 @@ class FMPStableClient:
         except requests.HTTPError as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 404:
                 return {}
-            logger.warning(f"FMP ratios_ttm({symbol}) failed: {e}")
+            logger.warning(f"FMP ratios_ttm({original_symbol} -> {symbol}) failed: {e}")
             return {}
         except Exception as e:
-            logger.warning(f"FMP ratios_ttm({symbol}) unexpected error: {e}")
+            logger.warning(f"FMP ratios_ttm({original_symbol} -> {symbol}) unexpected error: {e}")
             return {}
 
     @retry(
@@ -260,6 +277,8 @@ class FMPStableClient:
         Returns:
             List of news items, or [] on error
         """
+        original_symbol = symbol
+        symbol = normalize_for_fmp(symbol)
         try:
             data = self._get("stock-news", params={"tickers": symbol, "limit": limit})
             if isinstance(data, list):
@@ -270,10 +289,10 @@ class FMPStableClient:
         except requests.HTTPError as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 404:
                 return []
-            logger.warning(f"FMP stock_news({symbol}) failed: {e}")
+            logger.warning(f"FMP stock_news({original_symbol} -> {symbol}) failed: {e}")
             return []
         except Exception as e:
-            logger.warning(f"FMP stock_news({symbol}) unexpected error: {e}")
+            logger.warning(f"FMP stock_news({original_symbol} -> {symbol}) unexpected error: {e}")
             return []
 
     @retry(
@@ -300,6 +319,8 @@ class FMPStableClient:
         Returns:
             RSI value (float) if available, None otherwise
         """
+        original_symbol = symbol
+        symbol = normalize_for_fmp(symbol)
         try:
             # Convert interval format: "daily" -> "1day", "weekly" -> "1week", etc.
             timeframe_map = {
@@ -344,7 +365,7 @@ class FMPStableClient:
             # 404 or other errors - return None (indicator not available)
             return None
         except Exception as e:
-            logger.debug(f"FMP technical_indicator_rsi({symbol}) error: {e}")
+            logger.debug(f"FMP technical_indicator_rsi({original_symbol} -> {symbol}) error: {e}")
             return None
 
 
