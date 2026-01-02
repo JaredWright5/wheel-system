@@ -134,20 +134,29 @@ def main() -> None:
         
         # Fetch RSI for each ticker
         rows_to_upsert: List[Dict[str, Any]] = []
+        processed_tickers: set = set()  # Track tickers processed in this run
         
         for item in universe:
             ticker = item.get("symbol")
             if not ticker:
                 continue
             
-            # Skip if already cached for today
+            # Skip if already cached for today (from initial check)
             if ticker in existing_tickers:
                 skipped_due_to_cache += 1
+                continue
+            
+            # Skip if already processed in this run (deduplication within run)
+            if ticker in processed_tickers:
+                logger.debug(f"{ticker}: already processed in this run, skipping")
                 continue
             
             try:
                 # Fetch RSI from FMP (included in subscription)
                 rsi = fmp.technical_indicator_rsi(ticker, period=RSI_PERIOD, interval=RSI_INTERVAL)
+                
+                # Mark as processed before adding to batch
+                processed_tickers.add(ticker)
                 
                 if rsi is not None:
                     fetched_ok += 1
@@ -176,6 +185,7 @@ def main() -> None:
             except Exception as e:
                 logger.warning(f"{ticker}: error fetching RSI: {e}")
                 fetched_missing += 1
+                # Don't mark as processed if fetch failed (can retry next run)
                 continue
             
             # Batch insert every 50 rows to avoid large transactions
@@ -187,6 +197,8 @@ def main() -> None:
                     rows_to_upsert = []
                 except Exception as e:
                     logger.error(f"Error upserting RSI snapshots batch: {e}")
+                    # Don't clear rows_to_upsert on error - will be retried or logged
+                    # But clear to avoid infinite loop
                     rows_to_upsert = []
         
         # Insert remaining rows
