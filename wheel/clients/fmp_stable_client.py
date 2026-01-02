@@ -301,12 +301,22 @@ class FMPStableClient:
             RSI value (float) if available, None otherwise
         """
         try:
-            # Try technical-indicators/rsi endpoint
+            # Convert interval format: "daily" -> "1day", "weekly" -> "1week", etc.
+            timeframe_map = {
+                "daily": "1day",
+                "1day": "1day",
+                "weekly": "1week",
+                "1week": "1week",
+                "monthly": "1month",
+                "1month": "1month",
+            }
+            timeframe = timeframe_map.get(interval.lower(), interval)
+            
+            # FMP endpoint uses periodLength and timeframe (not period and interval)
             params = {
                 "symbol": symbol,
-                "period": period,
-                "interval": interval,
-                "limit": limit
+                "periodLength": period,
+                "timeframe": timeframe,
             }
             data = self._get("technical-indicators/rsi", params=params)
             
