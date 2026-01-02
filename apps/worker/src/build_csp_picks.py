@@ -15,7 +15,6 @@ from wheel.clients.supabase_client import get_supabase, upsert_rows
 from wheel.clients.schwab_marketdata_client import SchwabMarketDataClient
 from apps.worker.src.config.wheel_rules import (
     load_wheel_rules,
-    earnings_ok,
     find_expiration_in_window,
     is_within_dte_window,
     spread_ok,
@@ -348,7 +347,7 @@ def main() -> None:
         f"earnings_avoid_days={rules.earnings_avoid_days}, "
         f"liquidity: max_spread_pct={rules.max_spread_pct}%, "
         f"min_bid=${rules.min_bid:.2f}, min_oi={rules.min_open_interest}, "
-        f"max_abs_spread_low=${rules.max_abs_spread_low_premium:.2f}, "
+        f"max_abs_spread_low=${rules.max_abs_spread_high_premium:.2f}, "
         f"max_abs_spread_high=${rules.max_abs_spread_high_premium:.2f}"
     )
 
@@ -422,6 +421,10 @@ def main() -> None:
     skipped_bid_zero = 0
     skipped_spread = 0
     skipped_open_interest = 0
+    
+    # Earnings tracking
+    earnings_known = 0
+    earnings_unknown = 0
 
     now = datetime.now(timezone.utc).date()
 
@@ -431,30 +434,26 @@ def main() -> None:
             continue
 
         try:
-            # Check earnings exclusion
-            earn_in_days = c.get("earn_in_days")
-            if earn_in_days is not None:
-                # Calculate earnings date (if we have days until earnings)
-                earnings_date = now + timedelta(days=earn_in_days) if earn_in_days > 0 else None
-            else:
-                # Try to parse from metrics if available
+            # Load earnings_in_days from column or metrics JSON
+            earnings_in_days = c.get("earn_in_days")
+            if earnings_in_days is None:
+                # Try to load from metrics JSON
                 metrics = c.get("metrics") or {}
-                earn_in_days_from_metrics = metrics.get("earnings_in_days")
-                if earn_in_days_from_metrics is not None:
-                    earnings_date = now + timedelta(days=earn_in_days_from_metrics) if earn_in_days_from_metrics > 0 else None
-                else:
-                    earnings_date = None
+                earnings_in_days = metrics.get("earnings_in_days")
             
-            # Apply earnings exclusion
-            if not earnings_ok(earnings_date, now=now, avoid_days=rules.earnings_avoid_days):
+            # Track earnings statistics
+            if earnings_in_days is not None:
+                earnings_known += 1
+            else:
+                earnings_unknown += 1
+            
+            # Apply earnings exclusion: skip if earnings_in_days <= EARNINGS_AVOID_DAYS
+            if earnings_in_days is not None and earnings_in_days <= rules.earnings_avoid_days:
                 skipped_earnings_blocked += 1
                 logger.warning(
-                    f"{ticker}: skipped (earnings in {earn_in_days} days, "
-                    f"within avoid_days={rules.earnings_avoid_days})"
+                    f"{ticker}: blocked by earnings | earnings_in_days={earnings_in_days} avoid_days={rules.earnings_avoid_days}"
                 )
                 continue
-            elif earnings_date is None:
-                logger.debug(f"{ticker}: earnings date unknown (not excluded)")
 
             # Fetch option chain
             chain = md.get_option_chain(ticker, contract_type="PUT", strike_count=80)
@@ -590,7 +589,7 @@ def main() -> None:
                 "iv_rank": c.get("iv_rank"),
                 "beta": c.get("beta"),
                 "rsi": c.get("rsi"),
-                "earn_in_days": c.get("earn_in_days"),
+                "earn_in_days": earnings_in_days,  # Use the loaded value
                 "sentiment_score": c.get("sentiment_score"),
                 "pick_metrics": {
                     "rule_context": {
@@ -630,6 +629,7 @@ def main() -> None:
         f"processed={len(cands)}, "
         f"created={len(pick_rows)}, "
         f"skipped_earnings_blocked={skipped_earnings_blocked}, "
+        f"earnings_known={earnings_known}, earnings_unknown={earnings_unknown}, "
         f"skipped_no_chain={skipped_no_chain}, "
         f"skipped_no_contract_in_dte={skipped_no_contract_in_dte}, "
         f"skipped_delta_missing={skipped_delta_missing}, "
