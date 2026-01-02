@@ -33,6 +33,7 @@ class Candidate:
     price: Optional[float]
     beta: Optional[float]
     rsi: Optional[float]
+    earnings_date: Optional[date]
     earnings_in_days: Optional[int]
     fundamentals_score: int
     sentiment_score: int
@@ -291,40 +292,112 @@ def score_technical(rsi: Optional[float]) -> int:
         return clamp_int(100 * ((100 - rsi) / 30.0), 0, 100)
 
 
-def calculate_earnings_in_days(earnings_date_str: Optional[str]) -> Optional[int]:
+def fetch_earnings_date(
+    ticker: str,
+    fmp: FMPStableClient,
+    profile: Dict[str, Any],
+) -> Optional[date]:
     """
-    Calculate days until earnings from earnings date string.
+    Fetch earnings date for a ticker using FMP stable methods.
+    Tries earnings calendar endpoint first, then falls back to profile fields.
     
     Args:
-        earnings_date_str: Earnings date as ISO string (YYYY-MM-DD) or None
+        ticker: Stock symbol
+        fmp: FMP stable client
+        profile: Profile data already fetched (for fallback)
         
     Returns:
-        Days until earnings (int) if earnings_date_str is valid and in future, None otherwise
+        Earnings date (date) if found, None otherwise
     """
-    if not earnings_date_str:
+    now = datetime.now(timezone.utc).date()
+    
+    # Try earnings calendar endpoint (if available in FMP stable)
+    # Note: This may require premium subscription
+    try:
+        # FMP stable earnings calendar endpoint (if available)
+        # Format: /stable/earnings-calendar?symbol=AAPL or similar
+        # We'll try a generic approach
+        earnings_cal = fmp._get("earnings-calendar", params={"symbol": ticker})
+        if earnings_cal:
+            if isinstance(earnings_cal, list) and earnings_cal:
+                # Find next future earnings date
+                for item in earnings_cal:
+                    if isinstance(item, dict):
+                        earnings_date_str = item.get("date") or item.get("earningsDate") or item.get("reportDate")
+                        if earnings_date_str:
+                            try:
+                                if isinstance(earnings_date_str, str):
+                                    if "T" in earnings_date_str:
+                                        earnings_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
+                                    else:
+                                        earnings_date = date.fromisoformat(earnings_date_str[:10])
+                                    if earnings_date > now:
+                                        return earnings_date
+                            except Exception:
+                                pass
+            elif isinstance(earnings_cal, dict):
+                earnings_date_str = earnings_cal.get("date") or earnings_cal.get("earningsDate") or earnings_cal.get("reportDate")
+                if earnings_date_str:
+                    try:
+                        if isinstance(earnings_date_str, str):
+                            if "T" in earnings_date_str:
+                                earnings_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
+                            else:
+                                earnings_date = date.fromisoformat(earnings_date_str[:10])
+                            if earnings_date > now:
+                                return earnings_date
+                    except Exception:
+                        pass
+    except Exception:
+        # Earnings calendar endpoint may not be available or may require premium
+        pass
+    
+    # Fallback: Try profile fields (these are often dividend dates, not earnings, but best-effort)
+    # Common FMP profile fields that might contain earnings info
+    earnings_date_str = (
+        profile.get("nextEarningsDate") or
+        profile.get("earningsDate") or
+        profile.get("reportDate") or
+        profile.get("lastEarningsDate")  # Less useful but try anyway
+    )
+    
+    if earnings_date_str:
+        try:
+            if isinstance(earnings_date_str, str):
+                if "T" in earnings_date_str:
+                    earnings_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
+                else:
+                    earnings_date = date.fromisoformat(earnings_date_str[:10])
+                if earnings_date > now:
+                    return earnings_date
+        except Exception:
+            pass
+    
+    return None
+
+
+def calculate_earnings_in_days(earnings_date: Optional[date], now: Optional[date] = None) -> Optional[int]:
+    """
+    Calculate days until earnings from earnings date.
+    
+    Args:
+        earnings_date: Earnings date (date object) or None
+        now: Reference date (defaults to today UTC)
+        
+    Returns:
+        Days until earnings (int) if earnings_date is valid and in future, None otherwise
+    """
+    if earnings_date is None:
         return None
     
-    try:
-        # Parse date string (handle various formats)
-        if isinstance(earnings_date_str, str):
-            # Try ISO format first
-            if "T" in earnings_date_str:
-                earnings_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
-            else:
-                earnings_date = date.fromisoformat(earnings_date_str[:10])
-        else:
-            return None
-        
-        today = datetime.now(timezone.utc).date()
-        
-        # Only return positive days (future earnings)
-        if earnings_date > today:
-            return (earnings_date - today).days
-        else:
-            return None  # Earnings in past or today
-    except Exception as e:
-        logger.debug(f"Error parsing earnings date '{earnings_date_str}': {e}")
-        return None
+    if now is None:
+        now = datetime.now(timezone.utc).date()
+    
+    # Only return positive days (future earnings)
+    if earnings_date > now:
+        return (earnings_date - now).days
+    else:
+        return None  # Earnings in past or today
 
 
 def main() -> None:
@@ -389,8 +462,12 @@ def main() -> None:
         mcap_filtered = 0
         price_filtered = 0
         rsi_missing = 0
+        earnings_known = 0
+        earnings_unknown = 0
         passed_all_filters = 0
         
+        now = datetime.now(timezone.utc).date()
+
         for item in universe:
             t = item.get("symbol")
             if not t:
@@ -412,6 +489,16 @@ def main() -> None:
                     max_age_hours=RSI_MAX_AGE_HOURS
                 )
                 
+                # Fetch earnings date (try earnings calendar, fallback to profile)
+                earnings_date = fetch_earnings_date(t, fmp, profile)
+                earnings_in_days = calculate_earnings_in_days(earnings_date, now=now)
+                
+                # Track earnings statistics
+                if earnings_date is not None:
+                    earnings_known += 1
+                else:
+                    earnings_unknown += 1
+                
                 # Track missing data
                 if not profile:
                     prof_missing += 1
@@ -422,12 +509,6 @@ def main() -> None:
                 price = quote.get("price")
                 market_cap = profile.get("mktCap") or quote.get("marketCap") or profile.get("marketCap")
                 beta = profile.get("beta") or quote.get("beta")
-                
-                # Extract earnings date (if available in profile)
-                earnings_date_str = profile.get("lastDivDate") or profile.get("exDividendDate") or profile.get("nextDividendDate")
-                # Note: FMP profile may not have earnings date; we try best-effort extraction
-                # Earnings calendar endpoint would be ideal but may require premium
-                earnings_in_days = calculate_earnings_in_days(earnings_date_str)
                 
                 # Filter: price required
                 if price is None or price <= 0:
@@ -451,6 +532,9 @@ def main() -> None:
                 if rsi is None:
                     rsi_missing += 1
                     # Continue processing (RSI missing is OK, treated as neutral in scoring)
+                
+                # Earnings exclusion is NOT applied here (happens in pick builders)
+                # We just track and store the data
                 
                 passed_all_filters += 1
                 
@@ -496,6 +580,7 @@ def main() -> None:
                     "rsi": rsi,
                     "rsi_period": rules.rsi_period,
                     "rsi_interval": rules.rsi_interval,
+                    "earnings_date": earnings_date.isoformat() if earnings_date else None,
                     "earnings_in_days": earnings_in_days,
                     "news_count": len(news),
                     "sentiment_raw": sent,
@@ -512,6 +597,7 @@ def main() -> None:
                     price=float(price),
                     beta=float(beta) if beta is not None else None,
                     rsi=rsi,
+                    earnings_date=earnings_date,
                     earnings_in_days=earnings_in_days,
                     fundamentals_score=f_score,
                     sentiment_score=sent_score,
@@ -544,7 +630,8 @@ def main() -> None:
             f"Filter stats: prof_missing={prof_missing}, quote_missing={quote_missing}, "
             f"price_missing={price_missing}, mcap_missing={mcap_missing}, "
             f"mcap_filtered={mcap_filtered}, price_filtered={price_filtered}, "
-            f"rsi_missing={rsi_missing}, passed_all_filters={passed_all_filters}"
+            f"rsi_missing={rsi_missing}, earnings_known={earnings_known}, "
+            f"earnings_unknown={earnings_unknown}, passed_all_filters={passed_all_filters}"
         )
         
         # Upsert tickers
@@ -567,12 +654,14 @@ def main() -> None:
                 "technical_score": c.technical_score,
                 "rsi_period": rules.rsi_period,
                 "rsi_interval": rules.rsi_interval,
+                "earnings_date": c.earnings_date.isoformat() if c.earnings_date else None,
                 "earnings_in_days": c.earnings_in_days,
                 "reasons": c.reasons,
                 "features": c.features,  # Full raw data dump
             }
             
-            cand_rows.append({
+            # Build row - try explicit columns first, fallback to metadata JSON
+            row = {
                 "run_id": run_id,
                 "ticker": c.ticker,
                 "score": int(c.wheel_score),
@@ -585,11 +674,17 @@ def main() -> None:
                 "iv_rank": None,  # IV rank computed from Schwab + history
                 "beta": c.beta,
                 "rsi": c.rsi,
-                "earn_in_days": c.earnings_in_days,  # Write to explicit column
                 "sentiment_score": c.sentiment_score,
-                "metrics": metrics,  # Also store in JSONB for redundancy
+                "metrics": metrics,  # Always store in JSONB for redundancy
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-            })
+            }
+            
+            # Add explicit columns if they exist in schema (earn_in_days is the column name)
+            # If column doesn't exist, it will be stored in metrics JSON
+            if c.earnings_in_days is not None:
+                row["earn_in_days"] = c.earnings_in_days
+            
+            cand_rows.append(row)
         
         logger.info(f"Upserting screening_candidates: {len(cand_rows)}")
         upsert_rows("screening_candidates", cand_rows, keys=["run_id", "ticker"])
@@ -620,12 +715,13 @@ def main() -> None:
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "candidates_count": candidates_count,
             "picks_count": 0,
-            "notes": f"OK: candidates written (source={universe_source})"
+            "notes": f"OK: candidates written (source={universe_source}, earnings_known={earnings_known}, earnings_unknown={earnings_unknown})"
         })
         
         logger.info(
             f"Run complete. run_id={run_id} | status=success | "
-            f"candidates={candidates_count} | picks=0"
+            f"candidates={candidates_count} | picks=0 | "
+            f"earnings_known={earnings_known} earnings_unknown={earnings_unknown}"
         )
         
     except Exception as e:
