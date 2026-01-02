@@ -1,3 +1,7 @@
+"""
+Build CC (Covered Call) picks from Schwab positions.
+Uses WheelRules for consistent configuration and applies earnings exclusion.
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone, date, timedelta
@@ -9,6 +13,12 @@ from loguru import logger
 from wheel.clients.supabase_client import get_supabase
 from wheel.clients.schwab_client import SchwabClient
 from wheel.clients.schwab_marketdata_client import SchwabMarketDataClient
+from wheel.clients.fmp_stable_client import FMPStableClient
+from apps.worker.src.config.wheel_rules import (
+    load_wheel_rules,
+    earnings_ok,
+    find_expiration_in_window,
+)
 
 # Load environment variables from .env.local
 load_dotenv(".env.local")
@@ -22,21 +32,12 @@ RUN_ID = os.getenv("RUN_ID")  # None = use latest
 # Number of positions to process (default 25)
 CC_PICKS_N = int(os.getenv("CC_PICKS_N", "25"))
 
-# DTE constraints for weeklies (primary window)
-MIN_DTE = int(os.getenv("MIN_DTE", "4"))
-MAX_DTE = int(os.getenv("MAX_DTE", "10"))
+# Liquidity/spread filters (configurable via env)
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "2.5"))  # Max spread as % of mid price
+MIN_OPEN_INTEREST = int(os.getenv("MIN_OPEN_INTEREST", "50"))  # Minimum open interest
 
-# Fallback DTE windows
-FALLBACK_MAX_DTE_1 = int(os.getenv("FALLBACK_MAX_DTE_1", "14"))
-FALLBACK_MIN_DTE_2 = int(os.getenv("FALLBACK_MIN_DTE_2", "1"))
-FALLBACK_MAX_DTE_2 = int(os.getenv("FALLBACK_MAX_DTE_2", "21"))
-
-# Delta band for covered calls
-DELTA_MIN = float(os.getenv("DELTA_MIN", "0.20"))
-DELTA_MAX = float(os.getenv("DELTA_MAX", "0.30"))
-
-# Ex-dividend guardrail
-EXDIV_SKIP_DAYS = int(os.getenv("EXDIV_SKIP_DAYS", "2"))
+# Allow ITM calls (default False - prefer OTM)
+ALLOW_ITM_CALLS = os.getenv("ALLOW_ITM_CALLS", "false").lower() == "true"
 
 # Test mode: comma-separated tickers (e.g., "AAPL,MSFT")
 CC_TEST_TICKERS = os.getenv("CC_TEST_TICKERS", "").strip()
@@ -46,56 +47,13 @@ CC_TEST_MODE = bool(CC_TEST_TICKERS)
 # ---------- Helpers ----------
 
 def _safe_float(x, default=None):
+    """Safely convert to float, returning default on error."""
     try:
         if x is None:
             return default
         return float(x)
     except Exception:
         return default
-
-
-def _find_expiration_in_window(expirations: List[date], min_dte: int, max_dte: int) -> Optional[date]:
-    """
-    Find the nearest expiration in the given DTE window.
-    Returns the expiration date if found, None otherwise.
-    """
-    today = datetime.now(timezone.utc).date()
-    future = sorted([d for d in expirations if d > today])
-    
-    # Find first expiration within DTE range
-    for exp in future:
-        dte = (exp - today).days
-        if min_dte <= dte <= max_dte:
-            return exp
-    
-    return None
-
-
-def _pick_expiration_tiered(expirations: List[date]) -> Tuple[Optional[date], Optional[str]]:
-    """
-    Tiered expiration selection:
-    1. Try [MIN_DTE, MAX_DTE] (primary weekly window)
-    2. Try [MIN_DTE, FALLBACK_MAX_DTE_1] (extended weekly window)
-    3. Try [FALLBACK_MIN_DTE_2, FALLBACK_MAX_DTE_2] (fallback window)
-    
-    Returns (expiration_date, window_name) or (None, None) if no match
-    """
-    # Primary window: [MIN_DTE, MAX_DTE]
-    exp = _find_expiration_in_window(expirations, MIN_DTE, MAX_DTE)
-    if exp:
-        return exp, "primary"
-    
-    # Fallback 1: [MIN_DTE, FALLBACK_MAX_DTE_1]
-    exp = _find_expiration_in_window(expirations, MIN_DTE, FALLBACK_MAX_DTE_1)
-    if exp:
-        return exp, "fallback1"
-    
-    # Fallback 2: [FALLBACK_MIN_DTE_2, FALLBACK_MAX_DTE_2]
-    exp = _find_expiration_in_window(expirations, FALLBACK_MIN_DTE_2, FALLBACK_MAX_DTE_2)
-    if exp:
-        return exp, "fallback2"
-    
-    return None, None
 
 
 def _parse_expirations_from_chain(chain: Any) -> List[date]:
@@ -167,21 +125,55 @@ def _extract_call_options_for_exp(chain: Dict[str, Any], exp: date) -> List[Dict
     return results
 
 
+def _check_liquidity(option: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """
+    Check if option meets liquidity requirements.
+    
+    Returns:
+        (is_valid, reason_if_invalid)
+    """
+    bid = _safe_float(option.get("bid"), 0.0) or 0.0
+    ask = _safe_float(option.get("ask"), 0.0) or 0.0
+    
+    # Require non-null bid/ask
+    if bid <= 0 or ask <= 0:
+        return False, "missing_bid_ask"
+    
+    # Calculate spread
+    mid = (bid + ask) / 2.0
+    if mid <= 0:
+        return False, "invalid_mid"
+    
+    spread = ask - bid
+    spread_pct = (spread / mid) * 100.0
+    
+    if spread_pct > MAX_SPREAD_PCT:
+        return False, f"spread_too_wide_{spread_pct:.1f}%"
+    
+    # Check open interest
+    oi = _safe_float(option.get("openInterest"), 0.0) or 0.0
+    if oi < MIN_OPEN_INTEREST:
+        return False, f"low_oi_{int(oi)}"
+    
+    return True, None
+
+
 def _choose_best_call_in_delta_band(
     options: List[Dict[str, Any]],
     *,
-    target_delta_low: float = 0.20,
-    target_delta_high: float = 0.30,
+    target_delta_low: float,
+    target_delta_high: float,
     current_price: float,
     expiration: date,
+    rules,
 ) -> Optional[Dict[str, Any]]:
     """
     Choose the best CALL option in the target delta band that maximizes annualized yield.
     
     Requirements:
     - delta in [target_delta_low, target_delta_high] (calls have positive delta)
-    - bid > 0
-    - Prefer OTM calls (strike >= current_price)
+    - Passes liquidity checks (bid>0, spread, OI)
+    - Prefer OTM calls (strike >= current_price) unless ALLOW_ITM_CALLS=true
     - Maximizes annualized_yield = (premium / strike) * (365 / dte)
     """
     if not options:
@@ -202,21 +194,13 @@ def _choose_best_call_in_delta_band(
         if not (target_delta_low <= delta <= target_delta_high):
             continue
 
-        # Check bid > 0
-        bid = _safe_float(o.get("bid"), 0.0) or 0.0
-        if bid <= 0:
-            continue
-
-        # Prefer OTM calls (strike >= current_price)
-        strike = _safe_float(o.get("strike"))
-        if strike is None or strike <= 0:
-            continue
-        
-        if strike < current_price:
-            # ITM call - skip (prefer OTM)
-            continue
+        # Check liquidity
+        is_liquid, liquidity_reason = _check_liquidity(o)
+        if not is_liquid:
+            continue  # Skip but don't log here (too verbose)
 
         # Premium estimate (prefer mark, fallback to mid, then last)
+        bid = _safe_float(o.get("bid"), 0.0) or 0.0
         ask = _safe_float(o.get("ask"), 0.0) or 0.0
         mark = _safe_float(o.get("mark"))
         last = _safe_float(o.get("last"))
@@ -228,6 +212,15 @@ def _choose_best_call_in_delta_band(
         if mark is None or mark <= 0:
             continue
 
+        strike = _safe_float(o.get("strike"))
+        if strike is None or strike <= 0:
+            continue
+        
+        # ITM/OTM check: prefer OTM calls unless explicitly allowed
+        if not ALLOW_ITM_CALLS and strike < current_price:
+            # ITM call - skip (prefer OTM)
+            continue
+
         # Calculate annualized yield: (premium / strike) * (365 / dte)
         premium_yield = mark / strike
         annualized_yield = premium_yield * (365.0 / float(dte))
@@ -237,6 +230,7 @@ def _choose_best_call_in_delta_band(
             "_delta": delta,
             "_premium": mark,
             "_annualized_yield": annualized_yield,
+            "_liquidity_ok": True,
         })
 
     if not candidates:
@@ -247,26 +241,71 @@ def _choose_best_call_in_delta_band(
     return candidates[0]
 
 
-def _annualized_yield(premium: float, strike: float, dte: int) -> Optional[float]:
-    """Calculate annualized yield: (premium / strike) * (365 / dte)"""
-    if premium is None or strike is None or dte is None:
-        return None
-    if strike <= 0 or dte <= 0:
-        return None
-    premium_yield = premium / strike
-    return premium_yield * (365.0 / float(dte))
-
-
-def _check_exdiv_guardrail(ticker: str, sb: Any) -> Tuple[bool, Optional[str]]:
+def _pick_expiration_with_fallback(
+    expirations: List[date],
+    rules,
+    now: Optional[date] = None,
+) -> Tuple[Optional[date], Optional[str]]:
     """
-    Check if ticker has ex-dividend date within EXDIV_SKIP_DAYS.
-    Returns (should_skip, exdiv_date_str or None)
-    """
-    today = datetime.now(timezone.utc).date()
-    cutoff_date = today + timedelta(days=EXDIV_SKIP_DAYS)
+    Pick expiration using primary window, with fallback if allowed.
     
+    Returns:
+        (expiration_date, window_name) or (None, None) if no match
+    """
+    if now is None:
+        now = datetime.now(timezone.utc).date()
+    
+    # Primary window: [DTE_MIN_PRIMARY, DTE_MAX_PRIMARY]
+    exp = find_expiration_in_window(
+        expirations,
+        min_dte=rules.dte_min_primary,
+        max_dte=rules.dte_max_primary,
+        now=now,
+    )
+    if exp:
+        return exp, "primary"
+    
+    # Fallback window (if allowed)
+    if rules.allow_fallback_dte:
+        exp = find_expiration_in_window(
+            expirations,
+            min_dte=rules.dte_min_fallback,
+            max_dte=rules.dte_max_fallback,
+            now=now,
+        )
+        if exp:
+            return exp, "fallback"
+    
+    return None, None
+
+
+def _get_earnings_date_for_ticker(
+    ticker: str,
+    candidate: Optional[Dict[str, Any]],
+    sb: Any,
+    fmp: Optional[FMPStableClient],
+    now: date,
+) -> Optional[date]:
+    """
+    Get earnings date for a ticker, preferring cached candidate data, then FMP.
+    
+    Returns:
+        Earnings date if found, None otherwise
+    """
+    # 1) Try from candidate data (most reliable - from weekly_screener)
+    if candidate:
+        earn_in_days = candidate.get("earn_in_days")
+        if earn_in_days is not None and earn_in_days > 0:
+            return now + timedelta(days=earn_in_days)
+        
+        # Try from candidate metrics
+        metrics = candidate.get("metrics") or {}
+        earn_in_days_from_metrics = metrics.get("earnings_in_days")
+        if earn_in_days_from_metrics is not None and earn_in_days_from_metrics > 0:
+            return now + timedelta(days=earn_in_days_from_metrics)
+    
+    # 2) Try from tickers table (if we store it there)
     try:
-        # Try to get ex-div date from tickers table (if we store it)
         ticker_row = (
             sb.table("tickers")
             .select("ticker, metrics")
@@ -279,31 +318,51 @@ def _check_exdiv_guardrail(ticker: str, sb: Any) -> Tuple[bool, Optional[str]]:
         if ticker_row and ticker_row[0].get("metrics"):
             metrics = ticker_row[0]["metrics"]
             if isinstance(metrics, dict):
-                exdiv_str = metrics.get("exDividendDate") or metrics.get("ex_dividend_date")
-                if exdiv_str:
-                    try:
-                        exdiv_date = date.fromisoformat(str(exdiv_str)[:10])
-                        if today <= exdiv_date <= cutoff_date:
-                            return True, exdiv_date.isoformat()
-                    except Exception:
-                        pass
+                earn_in_days = metrics.get("earnings_in_days")
+                if earn_in_days is not None and earn_in_days > 0:
+                    return now + timedelta(days=earn_in_days)
     except Exception:
-        # If we can't determine ex-div, proceed but enforce OTM strictly
         pass
     
-    return False, None
+    # 3) Fallback to FMP if available (but don't block if unavailable)
+    if fmp:
+        try:
+            profile = fmp.profile(ticker) or {}
+            # FMP profile may have earnings date fields (varies by subscription)
+            # This is best-effort
+            earnings_date_str = profile.get("lastDivDate") or profile.get("nextEarningsDate")
+            if earnings_date_str:
+                try:
+                    if isinstance(earnings_date_str, str):
+                        if "T" in earnings_date_str:
+                            earnings_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
+                        else:
+                            earnings_date = date.fromisoformat(earnings_date_str[:10])
+                        if earnings_date > now:
+                            return earnings_date
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    
+    return None
 
 
 # ---------- Main ----------
 
 def main() -> None:
+    # Load wheel rules
+    rules = load_wheel_rules()
     mode = "test" if CC_TEST_MODE else "positions"
     logger.info(
-        f"Starting build_cc_picks (mode={mode}, CC_PICKS_N={CC_PICKS_N}, "
-        f"primary=[{MIN_DTE},{MAX_DTE}], "
-        f"fallback1=[{MIN_DTE},{FALLBACK_MAX_DTE_1}], "
-        f"fallback2=[{FALLBACK_MIN_DTE_2},{FALLBACK_MAX_DTE_2}], "
-        f"delta=[{DELTA_MIN},{DELTA_MAX}])..."
+        f"Wheel rules in effect: "
+        f"CC delta=[{rules.cc_delta_min:.2f}, {rules.cc_delta_max:.2f}], "
+        f"DTE primary=[{rules.dte_min_primary}, {rules.dte_max_primary}], "
+        f"DTE fallback=[{rules.dte_min_fallback}, {rules.dte_max_fallback}] "
+        f"(allow_fallback={rules.allow_fallback_dte}), "
+        f"earnings_avoid_days={rules.earnings_avoid_days}, "
+        f"liquidity: max_spread={MAX_SPREAD_PCT}%, min_oi={MIN_OPEN_INTEREST}, "
+        f"allow_itm_calls={ALLOW_ITM_CALLS}"
     )
 
     sb = get_supabase()
@@ -407,7 +466,7 @@ def main() -> None:
         logger.warning(f"No eligible positions found (mode={mode})")
         return
     
-    # 3) Get candidate data for these tickers (for copying fields)
+    # 3) Get candidate data for these tickers (for copying fields and earnings lookup)
     ticker_symbols = [p["symbol"] for p in eligible_positions]
     candidates_map: Dict[str, Dict[str, Any]] = {}
     if ticker_symbols:
@@ -426,16 +485,28 @@ def main() -> None:
         except Exception as e:
             logger.warning(f"Could not fetch candidate data: {e}")
     
-    # 4) Fetch option chains and build picks
+    # 4) Initialize FMP client for earnings lookup fallback (optional)
+    fmp: Optional[FMPStableClient] = None
+    try:
+        fmp = FMPStableClient()
+    except Exception as e:
+        logger.debug(f"FMP client not available for earnings lookup: {e}")
+    
+    # 5) Fetch option chains and build picks
     md = SchwabMarketDataClient()
     
     pick_rows: List[Dict[str, Any]] = []
+    
+    # Skip counters by reason
+    skipped_earnings_blocked = 0
     skipped_no_chain = 0
-    skipped_no_exp = 0
-    skipped_no_calls_in_band = 0
-    skipped_exdiv = 0
+    skipped_no_contract_in_dte = 0
+    skipped_no_contract_in_delta = 0
+    skipped_liquidity_failed = 0
     skipped_no_shares = 0
     
+    now = datetime.now(timezone.utc).date()
+
     for pos in eligible_positions:
         ticker = pos["symbol"]
         quantity = pos["quantity"]
@@ -449,12 +520,20 @@ def main() -> None:
             continue
         
         try:
-            # Check ex-div guardrail
-            should_skip_exdiv, exdiv_date = _check_exdiv_guardrail(ticker, sb)
-            if should_skip_exdiv:
-                skipped_exdiv += 1
-                logger.warning(f"{ticker}: skipping due to ex-div date {exdiv_date} within {EXDIV_SKIP_DAYS} days")
+            # Check earnings exclusion
+            candidate = candidates_map.get(ticker)
+            earnings_date = _get_earnings_date_for_ticker(ticker, candidate, sb, fmp, now)
+            
+            if not earnings_ok(earnings_date, now=now, avoid_days=rules.earnings_avoid_days):
+                skipped_earnings_blocked += 1
+                earn_in_days = (earnings_date - now).days if earnings_date else None
+                logger.warning(
+                    f"{ticker}: skipped (earnings in {earn_in_days} days, "
+                    f"within avoid_days={rules.earnings_avoid_days})"
+                )
                 continue
+            elif earnings_date is None:
+                logger.debug(f"{ticker}: earnings date unknown (not excluded)")
             
             # Fetch option chain (CALLS)
             chain = md.get_option_chain(ticker, contract_type="CALL", strike_count=80)
@@ -467,30 +546,29 @@ def main() -> None:
             if current_price is None:
                 current_price = _safe_float(chain.get("underlyingPrice") if isinstance(chain, dict) else None)
                 if current_price is None:
-                    skipped_no_calls_in_band += 1
+                    skipped_no_contract_in_delta += 1
                     logger.warning(f"{ticker}: cannot determine current price for OTM filter")
                     continue
             
             # Parse expirations and pick expiration using tiered strategy
             expirations = _parse_expirations_from_chain(chain)
             if not expirations:
-                skipped_no_exp += 1
+                skipped_no_contract_in_dte += 1
                 logger.warning(f"{ticker}: no expirations found in chain")
                 continue
             
-            # Try tiered expiration selection
-            exp, window_used = _pick_expiration_tiered(expirations)
+            # Try expiration selection with fallback
+            exp, window_used = _pick_expiration_with_fallback(expirations, rules, now=now)
             if not exp:
-                skipped_no_exp += 1
+                skipped_no_contract_in_dte += 1
                 # Log available expirations with their DTEs
-                today = datetime.now(timezone.utc).date()
-                exp_dtes = [(e, (e - today).days) for e in expirations if e > today]
+                exp_dtes = [(e, (e - now).days) for e in expirations if e > now]
                 exp_str = ", ".join([f"{e.isoformat()}(dte={dte})" for e, dte in sorted(exp_dtes, key=lambda x: x[1])])
                 logger.warning(
-                    f"{ticker}: no expiration in any window "
-                    f"(primary=[{MIN_DTE},{MAX_DTE}], "
-                    f"fallback1=[{MIN_DTE},{FALLBACK_MAX_DTE_1}], "
-                    f"fallback2=[{FALLBACK_MIN_DTE_2},{FALLBACK_MAX_DTE_2}]). "
+                    f"{ticker}: no expiration in DTE windows "
+                    f"(primary=[{rules.dte_min_primary},{rules.dte_max_primary}], "
+                    f"fallback=[{rules.dte_min_fallback},{rules.dte_max_fallback}], "
+                    f"allow_fallback={rules.allow_fallback_dte}). "
                     f"Available: {exp_str}"
                 )
                 continue
@@ -498,21 +576,27 @@ def main() -> None:
             # Extract CALL options for this expiration
             calls = _extract_call_options_for_exp(chain, exp)
             if not calls:
-                skipped_no_calls_in_band += 1
+                skipped_no_contract_in_delta += 1
                 logger.warning(f"{ticker}: no CALLs extracted for exp={exp}")
                 continue
             
-            # Choose best CALL in delta band [DELTA_MIN, DELTA_MAX]
+            # Choose best CALL in delta band [CC_DELTA_MIN, CC_DELTA_MAX]
             best = _choose_best_call_in_delta_band(
                 calls,
-                target_delta_low=DELTA_MIN,
-                target_delta_high=DELTA_MAX,
+                target_delta_low=rules.cc_delta_min,
+                target_delta_high=rules.cc_delta_max,
                 current_price=current_price,
                 expiration=exp,
+                rules=rules,
             )
             if not best:
-                skipped_no_calls_in_band += 1
-                logger.warning(f"{ticker}: no CALLs in delta band [{DELTA_MIN}, {DELTA_MAX}] with bid>0 and OTM")
+                skipped_no_contract_in_delta += 1
+                logger.warning(
+                    f"{ticker}: no CALLs in delta band "
+                    f"[{rules.cc_delta_min:.2f}, {rules.cc_delta_max:.2f}] "
+                    f"with liquidity (bid>0, spread<{MAX_SPREAD_PCT}%, oi>={MIN_OPEN_INTEREST}) "
+                    f"and OTM (allow_itm={ALLOW_ITM_CALLS})"
+                )
                 continue
             
             # Extract values
@@ -520,12 +604,9 @@ def main() -> None:
             premium = _safe_float(best.get("_premium"))
             delta = _safe_float(best.get("_delta"))
             bid = _safe_float(best.get("bid"), 0.0) or 0.0
-            today = datetime.now(timezone.utc).date()
-            dte = (exp - today).days
+            ask = _safe_float(best.get("ask"), 0.0) or 0.0
+            dte = (exp - now).days
             ann_yld = _safe_float(best.get("_annualized_yield"))
-            
-            # Get candidate data for this ticker (if available)
-            candidate = candidates_map.get(ticker, {})
             
             # Log successful pick with window used
             logger.info(
@@ -534,6 +615,15 @@ def main() -> None:
                 f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
                 f"shares={quantity} | mode={mode}"
             )
+            
+            # Get RSI period/interval from candidate metrics or use defaults
+            candidate_metrics = candidate.get("metrics") if candidate else {}
+            rsi_period = candidate_metrics.get("rsi_period") if isinstance(candidate_metrics, dict) else None
+            rsi_interval = candidate_metrics.get("rsi_interval") if isinstance(candidate_metrics, dict) else None
+            if not rsi_period:
+                rsi_period = rules.rsi_period
+            if not rsi_interval:
+                rsi_interval = rules.rsi_interval
             
             pick_rows.append({
                 "run_id": run_id,
@@ -547,23 +637,29 @@ def main() -> None:
                 "annualized_yield": ann_yld,
                 "delta": delta,
                 # Carry-through fields from screening_candidates (if available)
-                "score": candidate.get("score"),
-                "rank": candidate.get("rank"),
-                "price": candidate.get("price") or current_price,
-                "iv": candidate.get("iv"),
-                "iv_rank": candidate.get("iv_rank"),
-                "beta": candidate.get("beta"),
-                "rsi": candidate.get("rsi"),
-                "earn_in_days": candidate.get("earn_in_days"),
-                "sentiment_score": candidate.get("sentiment_score"),
+                "score": candidate.get("score") if candidate else None,
+                "rank": candidate.get("rank") if candidate else None,
+                "price": candidate.get("price") if candidate else current_price,
+                "iv": candidate.get("iv") if candidate else None,
+                "iv_rank": candidate.get("iv_rank") if candidate else None,
+                "beta": candidate.get("beta") if candidate else None,
+                "rsi": candidate.get("rsi") if candidate else None,
+                "earn_in_days": candidate.get("earn_in_days") if candidate else None,
+                "sentiment_score": candidate.get("sentiment_score") if candidate else None,
                 "pick_metrics": {
+                    "rule_context": {
+                        "used_dte_window": window_used,
+                        "earnings_avoid_days": rules.earnings_avoid_days,
+                        "delta_band": [rules.cc_delta_min, rules.cc_delta_max],
+                        "rsi_period": rsi_period,
+                        "rsi_interval": rsi_interval,
+                        "allow_itm_calls": ALLOW_ITM_CALLS,
+                    },
                     "expiration": exp.isoformat(),
-                    "window_used": window_used,
                     "quantity": quantity,
                     "current_price": current_price,
                     "mode": mode,
-                    "exdiv_checked": exdiv_date is not None,
-                    "exdiv_date": exdiv_date,
+                    "earnings_date": earnings_date.isoformat() if earnings_date else None,
                     "chain_raw_sample": {
                         "underlyingPrice": chain.get("underlyingPrice") if isinstance(chain, dict) else None,
                     },
@@ -586,24 +682,39 @@ def main() -> None:
             skipped_no_chain += 1
             logger.exception(f"{ticker}: failed to build CC pick: {e}")
     
-    # Log summary
+    # Log summary with skip counts by reason
     logger.info(
         f"CC pick generation summary (mode={mode}): "
         f"processed_positions={len(eligible_positions)}, "
-        f"eligible_positions={len(eligible_positions)}, "
         f"created={len(pick_rows)}, "
+        f"skipped_earnings_blocked={skipped_earnings_blocked}, "
         f"skipped_no_chain={skipped_no_chain}, "
-        f"skipped_no_exp={skipped_no_exp}, "
-        f"skipped_no_calls_in_band={skipped_no_calls_in_band}, "
-        f"skipped_exdiv={skipped_exdiv}, "
+        f"skipped_no_contract_in_dte={skipped_no_contract_in_dte}, "
+        f"skipped_no_contract_in_delta={skipped_no_contract_in_delta}, "
+        f"skipped_liquidity_failed={skipped_liquidity_failed}, "
         f"skipped_no_shares={skipped_no_shares}"
     )
+    
+    # Log top-10 summary of selected contracts
+    if pick_rows:
+        top10 = sorted(pick_rows, key=lambda x: x.get("annualized_yield") or 0.0, reverse=True)[:10]
+        logger.info("Top 10 CC picks by annualized yield:")
+        for i, pick in enumerate(top10, start=1):
+            ticker = pick.get("ticker")
+            yield_pct = pick.get("annualized_yield", 0.0) * 100.0
+            strike = pick.get("strike")
+            dte = pick.get("dte")
+            delta = pick.get("delta")
+            logger.info(
+                f"  {i}. {ticker}: {yield_pct:.2f}% yield | "
+                f"strike={strike} | dte={dte} | delta={delta:.3f}"
+            )
     
     if not pick_rows:
         logger.warning(f"No CC picks were generated (mode={mode}).")
         return
     
-    # 5) Delete existing CC picks for this run_id, then insert new ones
+    # 6) Delete existing CC picks for this run_id, then insert new ones
     logger.info(f"Deleting existing CC picks for run_id={run_id}")
     delete_res = (
         sb.table("screening_picks")
@@ -613,7 +724,7 @@ def main() -> None:
         .execute()
     )
     
-    # 6) Insert new picks (batch insert)
+    # 7) Insert new picks (batch insert)
     logger.info(f"Inserting {len(pick_rows)} screening_picks rows...")
     insert_res = sb.table("screening_picks").insert(pick_rows).execute()
     
