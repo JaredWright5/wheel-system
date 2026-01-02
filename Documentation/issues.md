@@ -33,19 +33,19 @@ No critical issues that prevent the system from functioning.
 
 ## Known Issues
 
-### 1. Duplicate Alpha Vantage Client Files
+### 1. Unused Alpha Vantage Client Files
 
-**Issue**: Two similar files exist:
-- `wheel/clients/alpha_vantage_client.py` (current, with throttling)
-- `wheel/clients/alphavantage_client.py` (old, unused)
+**Issue**: Alpha Vantage client files exist but are no longer used:
+- `wheel/clients/alpha_vantage_client.py` (unused)
+- `wheel/clients/alphavantage_client.py` (unused)
 
-**Status**: Old file should be removed (no longer used)
+**Status**: RSI is now sourced exclusively from FMP (no Alpha Vantage dependency)
 
 **Impact**: Low (doesn't affect functionality, just clutter)
 
-**Fix**: Delete `wheel/clients/alphavantage_client.py`
+**Fix**: Delete both Alpha Vantage client files (RSI comes from FMP only)
 
-**Location**: `wheel/clients/alphavantage_client.py`
+**Location**: `wheel/clients/alpha_vantage_client.py`, `wheel/clients/alphavantage_client.py`
 
 ### 2. Render Cron Schedule Doesn't Adjust for DST
 
@@ -79,19 +79,19 @@ No critical issues that prevent the system from functioning.
 
 **Location**: `render.yaml`
 
-### 4. Earnings Calendar Logic Disabled
+### 4. Earnings Calendar Logic
 
-**Issue**: Earnings filtering is disabled in `weekly_screener.py` due to FMP legacy endpoint issues.
+**Status**: Earnings avoidance is implemented in pick builders (`build_cc_picks.py`), not in screener.
 
-**Code Location**: `apps/worker/src/weekly_screener.py` line ~526
+**Current Behavior**:
+- Earnings date is stored in `screening_candidates.earn_in_days` (nullable)
+- If earnings date is missing/unknown, ticker is treated as safe (not excluded)
+- Pick builders check earnings and skip if within `EARNINGS_AVOID_DAYS` (default: 10 days)
+- Configurable via `EARNINGS_AVOID_DAYS` environment variable
 
-**Comment**: `"earn_in_days": None,  # TODO: Add earnings calendar logic"`
+**Impact**: Low (earnings filtering happens at pick generation, not screening)
 
-**Impact**: Medium (can't filter out stocks with earnings coming up)
-
-**Future Fix**: Re-implement using FMP stable earnings calendar endpoint or alternative source
-
-**Location**: `apps/worker/src/weekly_screener.py`
+**Location**: `apps/worker/src/build_cc_picks.py`, `apps/worker/src/config/wheel_rules.py`
 
 ### 5. IV/IV Rank Not Populated in Screening
 
@@ -133,6 +133,43 @@ No critical issues that prevent the system from functioning.
 
 
 
+
+
+## Missing Data Handling
+
+### RSI Missing or Unavailable
+
+**Behavior**: If RSI is missing for a ticker, the system degrades gracefully:
+- RSI is set to `None` in `screening_candidates` table
+- Technical score defaults to 50 (neutral) instead of crashing
+- Ticker is not excluded from screening (treated as neutral)
+- Weekly screener continues processing remaining tickers
+
+**Why Missing**:
+- FMP RSI endpoint may require premium subscription for some tickers (returns 402 Payment Required)
+- RSI snapshot worker may fail for individual tickers (timeout, API error)
+- Cache may be stale or incomplete
+
+**Impact**: Low (missing RSI doesn't prevent screening, just reduces technical score component)
+
+**Location**: `apps/worker/src/weekly_screener.py` (technical score calculation)
+
+### Earnings Date Missing or Unknown
+
+**Behavior**: If earnings date is missing/unknown:
+- `earn_in_days` is set to `None` in `screening_candidates` table
+- Ticker is treated as safe (not excluded) unless explicitly configured otherwise
+- Pick builders use `earnings_ok()` helper which returns `True` for `None` earnings dates
+- Only excludes if earnings date is known and within `EARNINGS_AVOID_DAYS` window
+
+**Why Missing**:
+- FMP earnings calendar data may not be available for all tickers
+- Earnings calendar endpoint may require premium subscription
+- Earnings dates may not be published yet
+
+**Impact**: Low (missing earnings date doesn't exclude ticker, just can't apply earnings guardrail)
+
+**Location**: `apps/worker/src/config/wheel_rules.py` (`earnings_ok()` function), `apps/worker/src/build_cc_picks.py`
 
 
 ## Workarounds & Quirks

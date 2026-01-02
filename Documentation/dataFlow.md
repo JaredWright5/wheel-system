@@ -168,11 +168,12 @@ class Candidate:
 
 #### 3. RSI Fetching Loop
 For each uncached ticker:
-- Calls `fmp.technical_indicator_rsi(ticker, period=14, interval='daily')`
+- Calls `fmp.technical_indicator_rsi(ticker, period=14, interval='1day')`
 - FMP endpoint: `/stable/technical-indicators/rsi?symbol=...&periodLength=14&timeframe=1day`
+- Uses standard RSI(14) with 1-day interval (configurable via `RSI_PERIOD`, `RSI_INTERVAL`)
 - Extracts latest RSI value from response (first item in array)
 - Creates row for `rsi_snapshots` table:
-  - `ticker`, `as_of_date`, `interval`, `period`, `rsi`, `source='fmp'`
+  - `ticker`, `as_of_date`, `interval='1day'`, `period=14`, `rsi`, `source='fmp'`
 
 #### 4. Batch Insert
 - Upserts rows in batches of 50 (to avoid large transactions)
@@ -227,14 +228,14 @@ For each candidate:
 - Extracts PUT options for each expiration
 
 **b. Expiration Selection** (Tiered Strategy):
-- **Primary**: Finds expiration in window `[MIN_DTE, MAX_DTE]` (default: 4-10 days)
-- **Fallback 1**: If not found, tries `[MIN_DTE, FALLBACK_MAX_DTE_1]` (default: 4-14 days)
-- **Fallback 2**: If still not found, tries `[FALLBACK_MIN_DTE_2, FALLBACK_MAX_DTE_2]` (default: 1-21 days)
+- **Primary**: Finds expiration in window `[DTE_MIN_PRIMARY, DTE_MAX_PRIMARY]` (default: 5-9 days)
+- **Fallback**: If not found and `ALLOW_FALLBACK_DTE=true`, tries `[DTE_MIN_FALLBACK, DTE_MAX_FALLBACK]` (default: 10-16 days)
 - Logs which window was used
+- All DTE parameters configurable via `apps/worker/src/config/wheel_rules.py`
 
 **c. Strike Selection**:
 - Filters PUTs by: `bid > 0` (must have liquidity)
-- Selects PUT closest to target delta (typically 0.30 for CSP)
+- Selects PUT closest to target delta within `[CSP_DELTA_MIN, CSP_DELTA_MAX]` (default: 0.20-0.30)
 - Extracts: `strike`, `premium` (bid), `delta`
 
 **d. Yield Calculation**:
@@ -251,11 +252,7 @@ For each candidate:
 - Deletes existing CSP picks for `run_id` (idempotent)
 - Inserts new picks (upsert with composite key: `run_id`, `ticker`, `action`)
 - Logs summary: `processed`, `created`, `skipped_*` counters
-
-### Error Handling
-- Individual ticker failures don't stop the run
-- Logs warnings for skipped tickers (no chain, no expiration, no deltas)
-- Continues processing remaining candidates
+- **Note**: Picks are stored for manual review; user submits trades manually (no auto-order placement)
 
 
 
@@ -309,13 +306,14 @@ For each eligible position:
 **c. Strike Selection**:
 - Filters CALLs by:
   - `bid > 0` (liquidity)
-  - `delta` in range `[DELTA_MIN, DELTA_MAX]` (default: 0.20-0.30)
+  - `delta` in range `[CC_DELTA_MIN, CC_DELTA_MAX]` (default: 0.20-0.30, configurable)
   - OTM: `strike > current_price` (out-of-the-money)
 - Selects best option (highest premium in delta band)
 
-**d. Ex-Dividend Guardrail**:
-- Checks if ex-dividend date is within `EXDIV_SKIP_DAYS` (default: 2 days)
-- Skips ticker if ex-dividend too close (avoids early assignment risk)
+**d. Earnings Avoidance Guardrail**:
+- Checks if earnings date is within `EARNINGS_AVOID_DAYS` (default: 10 days, configurable)
+- Skips ticker if earnings too close (avoids early assignment risk)
+- If earnings date is missing/unknown, treats as safe (does not exclude)
 
 **e. Data Storage**:
 - Creates row for `screening_picks` table:
@@ -327,6 +325,7 @@ For each eligible position:
 - Deletes existing CC picks for `run_id`
 - Inserts new picks
 - Logs summary with counters
+- **Note**: Picks are stored for manual review; user submits trades manually (no auto-order placement)
 
 
 

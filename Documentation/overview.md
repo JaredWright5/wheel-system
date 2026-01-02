@@ -18,7 +18,7 @@ This document provides a high-level understanding of the Wheel System architectu
 
 ## System Architecture
 
-The Wheel System is a **Python-based options trading automation platform** that runs on Render.com and uses Supabase for data storage.
+The Wheel System is a **Python-based options trading analysis platform** that runs on Render.com and uses Supabase for data storage. The system generates trading picks (CSP and CC options) for manual review and execution—it does not place orders automatically.
 
 ### High-Level Flow
 
@@ -38,6 +38,7 @@ The Wheel System is a **Python-based options trading automation platform** that 
    └─> CSP Picks: From top candidates
    └─> CC Picks: From existing positions
    └─> Stores in screening_picks table
+   └─> User reviews picks and submits trades manually (no auto-order placement)
 
 4. Daily Tracking (Weekdays 4:30 AM PT)
    └─> Snapshots Schwab account balances
@@ -73,24 +74,28 @@ The Wheel System is a **Python-based options trading automation platform** that 
 
 **rsi_snapshot.py** - RSI data caching worker
 - Processes all universe tickers daily
-- Fetches RSI from FMP API
+- Fetches RSI from FMP API (RSI(14), interval=1day)
 - Caches in `rsi_snapshots` table
 - Prevents rate limiting during screening
 
 **build_csp_picks.py** - Cash-Secured Put pick generator
 - Loads top candidates from latest screening run
 - Fetches Schwab option chains (PUT options)
-- Selects optimal strikes using tiered expiration strategy
+- Selects optimal strikes using tiered expiration strategy (primary: 5-9 DTE, fallback: 10-16 DTE)
+- Filters by delta band (0.20-0.30, configurable)
 - Calculates annualized yield
 - Writes to `screening_picks` table (action='CSP')
+- **Note**: Picks are for manual review; user submits trades manually
 
 **build_cc_picks.py** - Covered Call pick generator
 - Fetches eligible positions from Schwab (long, quantity >= 100)
 - Fetches Schwab option chains (CALL options)
-- Selects OTM calls in delta band [0.20, 0.30]
-- Includes ex-dividend guardrail
+- Selects OTM calls in delta band [0.20, 0.30] (configurable)
+- Uses tiered expiration strategy (primary: 5-9 DTE, fallback: 10-16 DTE)
+- Includes earnings avoidance guardrail (excludes if earnings within 10 days, configurable)
 - Writes to `screening_picks` table (action='CC')
 - Supports test mode via `CC_TEST_TICKERS` env var
+- **Note**: Picks are for manual review; user submits trades manually
 
 **daily_tracker.py** - Account snapshot worker
 - Fetches account balances and positions from Schwab
@@ -244,11 +249,14 @@ Mon-Fri 4:30 AM PT:
 - Tracks: `candidates_count`, `picks_count`, `build_sha`, `finished_at`, `error`
 - Enables debugging and monitoring
 
-### 3. Tiered Expiration Selection
-- Primary window: `MIN_DTE` to `MAX_DTE` (default 4-10 days)
-- Fallback 1: `MIN_DTE` to `FALLBACK_MAX_DTE_1` (default 4-14 days)
-- Fallback 2: `FALLBACK_MIN_DTE_2` to `FALLBACK_MAX_DTE_2` (default 1-21 days)
-- Prevents skipping tickers due to expiration availability
+### 3. Wheel Trading Rules (Configurable)
+- **Delta Bands**: CSP and CC both use 0.20-0.30 delta range (configurable via `CSP_DELTA_MIN/MAX`, `CC_DELTA_MIN/MAX`)
+- **DTE Windows**: Weeklies-first strategy
+  - Primary: 5-9 DTE (configurable via `DTE_MIN_PRIMARY`, `DTE_MAX_PRIMARY`)
+  - Fallback: 10-16 DTE (configurable via `DTE_MIN_FALLBACK`, `DTE_MAX_FALLBACK`)
+- **Earnings Avoidance**: Excludes symbols with earnings within next 10 days (configurable via `EARNINGS_AVOID_DAYS`)
+- **RSI Parameters**: RSI(14), interval=1day (configurable via `RSI_PERIOD`, `RSI_INTERVAL`)
+- All rules centralized in `apps/worker/src/config/wheel_rules.py`
 
 ### 4. Composite Key Deduplication
 - `upsert_rows()` deduplicates in-Python before sending to Supabase

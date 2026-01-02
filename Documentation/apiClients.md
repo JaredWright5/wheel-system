@@ -83,18 +83,19 @@ All clients are located in `wheel/clients/` directory.
 - **Returns**: Dictionary or `{}` if not found
 
 #### Technical Indicators - RSI
-- **Method**: `technical_indicator_rsi(symbol, period=14, interval='daily')`
+- **Method**: `technical_indicator_rsi(symbol, period=14, timeframe='1day')`
 - **Endpoint**: `/stable/technical-indicators/rsi?symbol=...&periodLength=14&timeframe=1day`
-- **Purpose**: RSI technical indicator
+- **Purpose**: RSI technical indicator (standard RSI(14), interval=1day)
 - **Parameters**:
-  - `periodLength`: RSI period (default: 14)
-  - `timeframe`: "1day", "1week", "1month" (maps "daily" → "1day")
+  - `periodLength`: RSI period (default: 14, configurable via `RSI_PERIOD`)
+  - `timeframe`: "1day" (default, configurable via `RSI_INTERVAL`)
 - **Returns**: Float (latest RSI value) or `None` if not available
 - **Response Format**: Array of objects with `date`, `rsi`, `open`, `high`, `low`, `close`, `volume`
 - **Quirks**: 
   - Returns array (not single value)
   - First item is most recent (sorted by date descending)
   - Must extract `rsi` field from first object
+- **Note**: RSI is sourced exclusively from FMP (no Alpha Vantage dependency)
 
 #### Stock News
 - **Method**: `stock_news(symbol, limit=50)`

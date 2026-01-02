@@ -18,7 +18,7 @@ This document describes the web dashboard application, its structure, routes, an
 
 ## Overview
 
-The dashboard is a **FastAPI web application** that provides a read-only interface for viewing screening results, candidates, and trading picks.
+The dashboard is a **FastAPI web application** that provides a read-only interface for viewing screening results, candidates, and trading picks. The dashboard displays picks for manual review—users submit trades manually (the system does not place orders automatically).
 
 **Technology Stack**:
 - **FastAPI** - Web framework
@@ -189,6 +189,10 @@ candidates, has_error = _safe_select("v_latest_run_top25_candidates", limit=25)
 **Content**:
 - Table of top 25 candidates
 - Columns: ticker, score, rank, price, market_cap, sector, industry, beta, rsi, sentiment_score
+- **Displays**:
+  - `earn_in_days`: Days until earnings (or "N/A" if unknown)
+  - `rsi`: RSI value used in scoring (or "N/A" if missing)
+  - Which rule excluded a candidate (if applicable, via `reasons` field in metrics)
 - Sorted by score DESC (highest first)
 
 ### Picks Template: `templates/picks.html`
@@ -196,6 +200,10 @@ candidates, has_error = _safe_select("v_latest_run_top25_candidates", limit=25)
 **Content**:
 - Two tables: CSP picks and CC picks
 - Columns: ticker, action, expiration, dte, strike, premium, delta, annualized_yield
+- **Displays**:
+  - `earn_in_days`: Days until earnings (or "N/A" if unknown)
+  - `rsi`: RSI value used in candidate scoring (or "N/A" if missing)
+  - `pick_metrics`: Additional metadata including which DTE window was used
 - Sorted by annualized_yield DESC (highest first)
 
 
