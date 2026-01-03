@@ -32,6 +32,9 @@ RUN_ID = os.getenv("RUN_ID")  # None = use latest
 # Number of candidates to process (default 25)
 PICKS_N = int(os.getenv("PICKS_N", "25"))
 
+# Maximum annualized yield (as decimal, e.g., 3.0 = 300%)
+MAX_ANNUALIZED_YIELD = float(os.getenv("MAX_ANNUALIZED_YIELD", "3.0"))
+
 
 # ---------- Helpers ----------
 
@@ -271,6 +274,16 @@ def _choose_best_put_in_delta_band(
         if mark is None or mark <= 0:
             continue
 
+        # Quote sanity checks
+        if ask < bid:
+            continue  # Invalid: ask < bid
+        mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else mark
+        if mid <= 0:
+            continue  # Invalid: mid must be > 0
+        abs_spread = ask - bid
+        if abs_spread <= 0:
+            continue  # Invalid: spread must be > 0
+
         strike = _safe_float(o.get("strike"))
         if strike is None or strike <= 0:
             continue
@@ -279,11 +292,21 @@ def _choose_best_put_in_delta_band(
         premium_yield = mark / strike
         annualized_yield = premium_yield * (365.0 / float(dte))
 
+        # Yield sanity check
+        if annualized_yield > MAX_ANNUALIZED_YIELD:
+            continue  # Reject contracts with unrealistic yields
+
+        # Calculate spread percentage
+        spread_pct = (abs_spread / mid) * 100.0 if mid > 0 else 0.0
+
         candidates.append({
             **o,
             "_abs_delta": abs_delta,
             "_premium": mark,
             "_annualized_yield": annualized_yield,
+            "_mid": mid,
+            "_spread_abs": abs_spread,
+            "_spread_pct": spread_pct,
             "_liquidity_ok": True,
         })
 
@@ -638,6 +661,9 @@ def main() -> None:
             ask = _safe_float(best.get("ask"), 0.0) or 0.0
             dte = (exp - now).days
             ann_yld = _safe_float(best.get("_annualized_yield"))
+            mid = _safe_float(best.get("_mid")) or ((bid + ask) / 2.0 if (bid > 0 and ask > 0) else premium)
+            spread_abs = _safe_float(best.get("_spread_abs")) or (ask - bid if (ask > bid) else 0.0)
+            spread_pct = _safe_float(best.get("_spread_pct")) or ((spread_abs / mid) * 100.0 if mid > 0 else 0.0)
 
             # Log successful pick with window used
             logger.info(
@@ -690,6 +716,10 @@ def main() -> None:
                         "delta": delta,
                         "bid": best.get("bid"),
                         "ask": best.get("ask"),
+                        "mid": mid,
+                        "spread_abs": spread_abs,
+                        "spread_pct": spread_pct,
+                        "annualized_yield": ann_yld,
                         "openInterest": best.get("openInterest"),
                         "volume": best.get("totalVolume") or best.get("volume"),
                         "inTheMoney": best.get("inTheMoney"),
