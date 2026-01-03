@@ -365,9 +365,6 @@ def _find_best_in_delta_contract(puts: List[Dict[str, Any]], target_delta_low: f
     Returns:
         Contract dict with spread info, or None if no contracts in delta band
     """
-    today = datetime.now(timezone.utc).date()
-    dte = (expiration - today).days
-    
     best_in_delta: Optional[Dict[str, Any]] = None
     best_spread_pct = float('inf')
     
