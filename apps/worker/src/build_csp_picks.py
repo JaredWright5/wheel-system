@@ -40,6 +40,66 @@ MAX_ANNUALIZED_YIELD = float(os.getenv("MAX_ANNUALIZED_YIELD", "3.0"))
 
 # ---------- Helpers ----------
 
+def normalize_exposure_symbol(symbol: str) -> str:
+    """
+    Normalize symbol to prevent duplicate economic exposure.
+    
+    Maps share classes to a canonical form to avoid duplicate picks for the same company:
+    - GOOG, GOOGL -> GOOGL (Alphabet class shares)
+    - BRK.A, BRK.B -> BRK.B (Berkshire Hathaway, wheel-friendly)
+    - BF.A, BF.B -> BF.B (Brown-Forman class shares)
+    - Other symbols are normalized using standard equity normalization
+    
+    Args:
+        symbol: Stock symbol (e.g., "GOOG", "GOOGL", "BRK.A", "BRK-B")
+        
+    Returns:
+        Canonical exposure symbol (e.g., "GOOGL", "BRK.B", "AAPL")
+        
+    Examples:
+        >>> normalize_exposure_symbol("GOOG")
+        'GOOGL'
+        >>> normalize_exposure_symbol("GOOGL")
+        'GOOGL'
+        >>> normalize_exposure_symbol("BRK.A")
+        'BRK.B'
+        >>> normalize_exposure_symbol("BRK-B")
+        'BRK.B'
+        >>> normalize_exposure_symbol("AAPL")
+        'AAPL'
+    """
+    if not symbol:
+        return symbol
+    
+    # Strip and uppercase
+    normalized = symbol.strip().upper()
+    
+    # Handle specific share class mappings
+    # Alphabet: GOOG -> GOOGL
+    if normalized == "GOOG":
+        return "GOOGL"
+    
+    # Berkshire Hathaway: BRK.A -> BRK.B (wheel-friendly)
+    if normalized in ("BRK.A", "BRK-A"):
+        return "BRK.B"
+    
+    # Brown-Forman: BF.A -> BF.B
+    if normalized in ("BF.A", "BF-A"):
+        return "BF.B"
+    
+    # For other symbols, use standard normalization (handles BRK.B, BF.B, etc.)
+    # Replace "/" with "." (rare edge cases)
+    normalized = normalized.replace("/", ".")
+    
+    # Replace "-" with "." for known class share tickers (BRK, BF)
+    if "-" in normalized:
+        ticker_base = normalized.split("-")[0]
+        if ticker_base in ("BRK", "BF"):
+            normalized = normalized.replace("-", ".")
+    
+    return normalized
+
+
 def _safe_float(x, default=None):
     """Safely convert to float, returning default on error."""
     try:
@@ -578,6 +638,9 @@ def main() -> None:
 
     pick_rows: List[Dict[str, Any]] = []
     
+    # Track seen exposure symbols to prevent duplicates
+    seen_exposure: set = set()
+    
     # Skip counters by reason
     skipped_earnings_blocked = 0
     skipped_no_chain = 0
@@ -588,6 +651,7 @@ def main() -> None:
     skipped_credit_too_low = 0
     skipped_spread = 0
     skipped_open_interest = 0
+    skipped_duplicate_exposure = 0
     
     # Earnings tracking
     earnings_known = 0
@@ -942,6 +1006,16 @@ def main() -> None:
                 if selection_reason:
                     metadata["window_comparison"]["selection_reason"] = selection_reason
 
+            # Check for duplicate economic exposure
+            exposure_key = normalize_exposure_symbol(ticker)
+            if exposure_key in seen_exposure:
+                skipped_duplicate_exposure += 1
+                logger.warning(f"{ticker}: skipped due to duplicate exposure ({exposure_key})")
+                continue
+            
+            # Add to seen set and accept the pick
+            seen_exposure.add(exposure_key)
+
             pick_rows.append({
                 "run_id": run_id,
                 "ticker": ticker,
@@ -1019,7 +1093,8 @@ def main() -> None:
         f"skipped_bid_zero={skipped_bid_zero}, "
         f"skipped_credit_too_low={skipped_credit_too_low}, "
         f"skipped_spread={skipped_spread}, "
-        f"skipped_open_interest={skipped_open_interest}"
+        f"skipped_open_interest={skipped_open_interest}, "
+        f"skipped_duplicate_exposure={skipped_duplicate_exposure}"
     )
 
     if not pick_rows:
