@@ -52,6 +52,10 @@ class WheelRules:
     MAX_ABS_SPREAD_LOW_PREMIUM: float = float(os.getenv("WHEEL_MAX_ABS_SPREAD_LOW_PREMIUM", "0.10"))   # if mid < 1.00
     MAX_ABS_SPREAD_HIGH_PREMIUM: float = float(os.getenv("WHEEL_MAX_ABS_SPREAD_HIGH_PREMIUM", "0.25"))  # if mid >= 1.00
 
+    # Safety rails for small accounts
+    MIN_UNDERLYING_PRICE: float = float(os.getenv("WHEEL_MIN_UNDERLYING_PRICE", "10.0"))  # Minimum underlying stock price - safety rail for small accounts
+    MAX_CSP_NOTIONAL: float = float(os.getenv("WHEEL_MAX_CSP_NOTIONAL", "60000.0"))  # Maximum CSP notional value (strike * 100) - safety rail for small accounts
+
     # Feature flags
     ALLOW_FALLBACK_DTE: bool = os.getenv("ALLOW_FALLBACK_DTE", "true").lower() == "true"
 
@@ -115,6 +119,14 @@ class WheelRules:
     @property
     def min_credit(self) -> float:
         return self.MIN_CREDIT
+
+    @property
+    def min_underlying_price(self) -> float:
+        return self.MIN_UNDERLYING_PRICE
+
+    @property
+    def max_csp_notional(self) -> float:
+        return self.MAX_CSP_NOTIONAL
 
     @property
     def max_abs_spread_low_premium(self) -> float:
