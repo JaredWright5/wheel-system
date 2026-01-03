@@ -8,16 +8,19 @@ earnings avoidance, RSI parameters, and liquidity filters.
 Liquidity Filtering Philosophy:
     Both percentage and absolute spread caps are used to handle edge cases:
     - Percentage caps (e.g., 7.5%) work well for higher-priced options (e.g., $10+ premiums)
-    - Absolute caps (e.g., $0.10 for low premiums, $0.25 for high premiums) prevent
-      wide spreads on low-priced options where a 7.5% spread might still be too tight
-      (e.g., a $0.50 option with a $0.04 spread = 8% but acceptable)
-    - This dual approach ensures reasonable liquidity filters across the full range of
-      option premiums typically seen in weeklies (from $0.05 to $5.00+)
+    - Tiered absolute caps prevent wide spreads across the full range of option premiums
+    - Tiered system allows realistic validation for higher-premium options:
+      * Tier 1 (mid < $1.00): $0.10 cap - very tight for penny options
+      * Tier 2 (mid < $3.00): $0.25 cap - reasonable for low-premium weeklies
+      * Tier 3 (mid < $8.00): $0.50 cap - accommodates mid-range premiums
+      * Tier 4 (mid >= $8.00): $1.00 cap - realistic for high-premium options
+    - This tiered approach ensures reasonable liquidity filters across the full range of
+      option premiums typically seen in weeklies (from $0.05 to $10.00+)
 """
 from dataclasses import dataclass
 import os
 from datetime import date, datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 
 @dataclass(frozen=True)
 class WheelRules:
@@ -49,8 +52,19 @@ class WheelRules:
     MIN_OPEN_INTEREST: int = int(os.getenv("WHEEL_MIN_OPEN_INTEREST", "10"))
     MIN_BID: float = float(os.getenv("WHEEL_MIN_BID", "0.05"))
     MIN_CREDIT: float = float(os.getenv("WHEEL_MIN_CREDIT", "0.25"))  # Minimum credit/premium - credit below this is usually not worth the assignment risk / transaction costs
-    MAX_ABS_SPREAD_LOW_PREMIUM: float = float(os.getenv("WHEEL_MAX_ABS_SPREAD_LOW_PREMIUM", "0.10"))   # if mid < 1.00
-    MAX_ABS_SPREAD_HIGH_PREMIUM: float = float(os.getenv("WHEEL_MAX_ABS_SPREAD_HIGH_PREMIUM", "0.25"))  # if mid >= 1.00
+
+    # Tiered absolute spread caps (based on option mid price)
+    # Tier thresholds (mid price boundaries)
+    SPREAD_TIER_1_MAX_MID: float = float(os.getenv("WHEEL_SPREAD_TIER_1_MAX_MID", "1.00"))   # Tier 1: mid < $1.00
+    SPREAD_TIER_2_MAX_MID: float = float(os.getenv("WHEEL_SPREAD_TIER_2_MAX_MID", "3.00"))   # Tier 2: mid < $3.00
+    SPREAD_TIER_3_MAX_MID: float = float(os.getenv("WHEEL_SPREAD_TIER_3_MAX_MID", "8.00"))   # Tier 3: mid < $8.00
+    # Tier 4: mid >= $8.00 (no threshold needed, it's the default)
+
+    # Tier absolute spread caps
+    SPREAD_TIER_1_MAX_ABS: float = float(os.getenv("WHEEL_SPREAD_TIER_1_MAX_ABS", "0.10"))   # Tier 1 cap: $0.10
+    SPREAD_TIER_2_MAX_ABS: float = float(os.getenv("WHEEL_SPREAD_TIER_2_MAX_ABS", "0.25"))   # Tier 2 cap: $0.25
+    SPREAD_TIER_3_MAX_ABS: float = float(os.getenv("WHEEL_SPREAD_TIER_3_MAX_ABS", "0.50"))   # Tier 3 cap: $0.50
+    SPREAD_TIER_4_MAX_ABS: float = float(os.getenv("WHEEL_SPREAD_TIER_4_MAX_ABS", "1.00"))   # Tier 4 cap: $1.00
 
     # Safety rails for small accounts
     MIN_UNDERLYING_PRICE: float = float(os.getenv("WHEEL_MIN_UNDERLYING_PRICE", "10.0"))  # Minimum underlying stock price - safety rail for small accounts
@@ -129,14 +143,6 @@ class WheelRules:
         return self.MAX_CSP_NOTIONAL
 
     @property
-    def max_abs_spread_low_premium(self) -> float:
-        return self.MAX_ABS_SPREAD_LOW_PREMIUM
-
-    @property
-    def max_abs_spread_high_premium(self) -> float:
-        return self.MAX_ABS_SPREAD_HIGH_PREMIUM
-
-    @property
     def allow_fallback_dte(self) -> bool:
         return self.ALLOW_FALLBACK_DTE
 
@@ -164,15 +170,56 @@ class WheelRules:
             raise ValueError("MIN_UNDERLYING_PRICE cannot be negative")
         if self.MAX_CSP_NOTIONAL < 0:
             raise ValueError("MAX_CSP_NOTIONAL cannot be negative")
-        if self.MAX_ABS_SPREAD_LOW_PREMIUM < 0:
-            raise ValueError("MAX_ABS_SPREAD_LOW_PREMIUM cannot be negative")
-        if self.MAX_ABS_SPREAD_HIGH_PREMIUM < 0:
-            raise ValueError("MAX_ABS_SPREAD_HIGH_PREMIUM cannot be negative")
+        # Validate tier thresholds are in ascending order
+        if not (self.SPREAD_TIER_1_MAX_MID < self.SPREAD_TIER_2_MAX_MID < self.SPREAD_TIER_3_MAX_MID):
+            raise ValueError("SPREAD_TIER thresholds must be in ascending order: TIER_1 < TIER_2 < TIER_3")
+        # Validate tier caps are in ascending order
+        if not (self.SPREAD_TIER_1_MAX_ABS < self.SPREAD_TIER_2_MAX_ABS < self.SPREAD_TIER_3_MAX_ABS < self.SPREAD_TIER_4_MAX_ABS):
+            raise ValueError("SPREAD_TIER caps must be in ascending order: TIER_1 < TIER_2 < TIER_3 < TIER_4")
+        if self.SPREAD_TIER_1_MAX_ABS < 0 or self.SPREAD_TIER_2_MAX_ABS < 0 or self.SPREAD_TIER_3_MAX_ABS < 0 or self.SPREAD_TIER_4_MAX_ABS < 0:
+            raise ValueError("SPREAD_TIER caps cannot be negative")
 
 
 def load_wheel_rules() -> WheelRules:
     """Loads WheelRules from environment variables."""
     return WheelRules()
+
+
+def abs_spread_cap_for_mid(mid: float, rules: WheelRules) -> float:
+    """
+    Determine the absolute spread cap for a given option mid price using tiered thresholds.
+    
+    Tiering rationale:
+    - Lower-premium options need tighter absolute caps to prevent wide spreads
+    - Higher-premium options can tolerate wider absolute spreads while maintaining reasonable percentage spreads
+    - This tiered approach makes spread validation realistic across the full range of option premiums
+    
+    Args:
+        mid: Option mid price (average of bid and ask)
+        rules: WheelRules instance containing tier thresholds and caps
+        
+    Returns:
+        Maximum allowed absolute spread for the given mid price
+        
+    Examples:
+        >>> rules = load_wheel_rules()
+        >>> abs_spread_cap_for_mid(0.50, rules)  # Tier 1
+        0.10
+        >>> abs_spread_cap_for_mid(2.00, rules)  # Tier 2
+        0.25
+        >>> abs_spread_cap_for_mid(5.00, rules)  # Tier 3
+        0.50
+        >>> abs_spread_cap_for_mid(10.00, rules)  # Tier 4
+        1.00
+    """
+    if mid < rules.SPREAD_TIER_1_MAX_MID:
+        return rules.SPREAD_TIER_1_MAX_ABS
+    elif mid < rules.SPREAD_TIER_2_MAX_MID:
+        return rules.SPREAD_TIER_2_MAX_ABS
+    elif mid < rules.SPREAD_TIER_3_MAX_MID:
+        return rules.SPREAD_TIER_3_MAX_ABS
+    else:
+        return rules.SPREAD_TIER_4_MAX_ABS
 
 
 def is_within_dte_window(
@@ -301,60 +348,81 @@ def find_expiration_in_window(
 def spread_ok(
     bid: float,
     ask: float,
-    max_spread_pct: float,
-    max_abs_low: float,
-    max_abs_high: float,
-) -> bool:
+    rules: WheelRules,
+) -> Tuple[bool, Dict[str, Any]]:
     """
-    Check if option spread meets liquidity requirements.
+    Check if option spread meets liquidity requirements using tiered absolute spread caps.
     
-    Uses both percentage and absolute spread caps to handle edge cases:
+    Uses both percentage and tiered absolute spread caps to handle edge cases:
     - Percentage caps work well for higher-priced options
-    - Absolute caps prevent wide spreads on low-priced options
+    - Tiered absolute caps prevent wide spreads across the full range of option premiums
+    - Tiered system allows realistic validation for higher-premium options
     
     Args:
         bid: Bid price
         ask: Ask price
-        max_spread_pct: Maximum spread as percentage (e.g., 7.5 for 7.5%)
-        max_abs_low: Maximum absolute spread for low premiums (mid < 1.00)
-        max_abs_high: Maximum absolute spread for high premiums (mid >= 1.00)
+        rules: WheelRules instance containing spread thresholds and tier configuration
         
     Returns:
-        True if spread passes both percentage and absolute checks, False otherwise
+        Tuple of (ok: bool, details: dict)
+        details dict includes:
+        - mid: Option mid price
+        - spread_abs: Absolute spread (ask - bid)
+        - spread_pct: Spread as percentage of mid
+        - abs_cap_used: The absolute spread cap that was applied for this mid price
         
     Examples:
-        >>> spread_ok(bid=1.0, ask=1.07, max_spread_pct=7.5, max_abs_low=0.10, max_abs_high=0.25)
-        True  # 7% spread < 7.5%, and $0.07 < $0.25
-        >>> spread_ok(bid=0.50, ask=0.57, max_spread_pct=7.5, max_abs_low=0.10, max_abs_high=0.25)
-        False  # 14% spread > 7.5% (fails percentage check)
-        >>> spread_ok(bid=0.50, ask=0.58, max_spread_pct=10.0, max_abs_low=0.10, max_abs_high=0.25)
-        False  # 16% spread > 10%, but also $0.08 < $0.10 (would pass abs, but fails pct)
-        >>> spread_ok(bid=0.45, ask=0.55, max_spread_pct=10.0, max_abs_low=0.10, max_abs_high=0.25)
-        False  # 20% spread > 10% (fails percentage check), but also $0.10 = $0.10 (fails abs)
+        >>> rules = load_wheel_rules()
+        >>> ok, details = spread_ok(bid=1.0, ask=1.07, rules=rules)
+        >>> ok
+        True  # 7% spread < 7.5%, and $0.07 < tier cap
+        >>> details["abs_cap_used"]
+        0.25  # Tier 2 cap for mid=$1.00
     """
+    # Validate inputs
     if bid <= 0 or ask <= 0:
-        return False
+        return False, {
+            "mid": None,
+            "spread_abs": None,
+            "spread_pct": None,
+            "abs_cap_used": None,
+        }
+    
+    if ask < bid:
+        return False, {
+            "mid": None,
+            "spread_abs": None,
+            "spread_pct": None,
+            "abs_cap_used": None,
+        }
     
     mid = (bid + ask) / 2.0
     if mid <= 0:
-        return False
+        return False, {
+            "mid": None,
+            "spread_abs": None,
+            "spread_pct": None,
+            "abs_cap_used": None,
+        }
     
-    abs_spread = ask - bid
+    spread_abs = ask - bid
+    spread_pct = (spread_abs / mid) * 100.0 if mid > 0 else 0.0
     
-    # Percentage spread check
-    pct_spread = (abs_spread / mid) * 100.0
-    if pct_spread > max_spread_pct:
-        return False
+    # Get tiered absolute spread cap for this mid price
+    abs_cap = abs_spread_cap_for_mid(mid, rules)
     
-    # Absolute spread check (depends on premium level)
-    if mid < 1.00:
-        if abs_spread > max_abs_low:
-            return False
-    else:
-        if abs_spread > max_abs_high:
-            return False
+    # Check both percentage and absolute caps
+    pct_ok = spread_pct <= rules.MAX_SPREAD_PCT
+    abs_ok = spread_abs <= abs_cap
     
-    return True
+    ok = pct_ok and abs_ok
+    
+    return ok, {
+        "mid": mid,
+        "spread_abs": spread_abs,
+        "spread_pct": spread_pct,
+        "abs_cap_used": abs_cap,
+    }
 
 
 if __name__ == "__main__":
@@ -373,7 +441,7 @@ if __name__ == "__main__":
     logger.info(f"  RSI Period: {rules.rsi_period}, Interval: {rules.rsi_interval}")
     logger.info(f"  Allow Fallback DTE: {rules.allow_fallback_dte}")
     logger.info(f"  Liquidity: max_spread_pct={rules.max_spread_pct}%, min_oi={rules.min_open_interest}, min_bid=${rules.min_bid:.2f}, min_credit=${rules.min_credit:.2f}")
-    logger.info(f"  Liquidity: max_abs_spread_low=${rules.max_abs_spread_low_premium:.2f}, max_abs_spread_high=${rules.max_abs_spread_high_premium:.2f}")
+    logger.info(f"  Spread tiers: Tier1(mid<${rules.SPREAD_TIER_1_MAX_MID:.2f})=${rules.SPREAD_TIER_1_MAX_ABS:.2f}, Tier2(mid<${rules.SPREAD_TIER_2_MAX_MID:.2f})=${rules.SPREAD_TIER_2_MAX_ABS:.2f}, Tier3(mid<${rules.SPREAD_TIER_3_MAX_MID:.2f})=${rules.SPREAD_TIER_3_MAX_ABS:.2f}, Tier4(mid>=${rules.SPREAD_TIER_3_MAX_MID:.2f})=${rules.SPREAD_TIER_4_MAX_ABS:.2f}")
     logger.info(f"  Safety rails: min_underlying_price=${rules.min_underlying_price:.2f}, max_csp_notional=${rules.max_csp_notional:,.0f}")
 
     # Test is_within_dte_window
@@ -406,21 +474,33 @@ if __name__ == "__main__":
     found_exp = find_expiration_in_window(test_expirations, rules.dte_min_primary, rules.dte_max_primary, today)
     logger.info(f"  Found in [{rules.dte_min_primary}, {rules.dte_max_primary}]: {found_exp}")
 
-    # Test spread_ok
+    # Test abs_spread_cap_for_mid
+    logger.info("\n✅ abs_spread_cap_for_mid tests:")
+    test_mids = [0.50, 1.00, 2.00, 5.00, 10.00]
+    for mid in test_mids:
+        cap = abs_spread_cap_for_mid(mid, rules)
+        logger.info(f"  mid=${mid:.2f} -> cap=${cap:.2f}")
+
+    # Test spread_ok with new signature
     logger.info("\n✅ spread_ok tests:")
     test_cases = [
-        (1.0, 1.07, True),   # 7% spread, $0.07 abs - should pass
+        (1.0, 1.07, True),   # 7% spread, $0.07 abs - should pass (Tier 2, cap=$0.25)
         (0.50, 0.57, False), # 14% spread - should fail pct check
         (0.50, 0.58, False), # 16% spread - should fail pct check
-        (0.45, 0.55, False), # 20% spread, $0.10 abs - should fail pct check
+        (0.45, 0.55, False), # 20% spread, $0.10 abs - should fail pct check (Tier 1, cap=$0.10)
         (1.0, 1.08, False),  # 7.7% spread, $0.08 abs - should fail (7.7% > 7.5%)
-        (2.0, 2.15, True),   # 7.5% spread, $0.15 abs - should pass
+        (2.0, 2.15, True),   # 7.5% spread, $0.15 abs - should pass (Tier 2, cap=$0.25)
         (2.0, 2.26, False),  # 13% spread, $0.26 abs - should fail pct check
+        (5.0, 5.35, True),   # 7% spread, $0.35 abs - should pass (Tier 3, cap=$0.50)
+        (10.0, 10.70, True), # 7% spread, $0.70 abs - should pass (Tier 4, cap=$1.00)
     ]
     for bid, ask, expected in test_cases:
-        result = spread_ok(bid, ask, rules.max_spread_pct, rules.max_abs_spread_low_premium, rules.max_abs_spread_high_premium)
-        status = "✅" if result == expected else "❌"
-        pct = ((ask - bid) / ((bid + ask) / 2.0)) * 100.0
-        logger.info(f"  {status} bid=${bid:.2f} ask=${ask:.2f} ({pct:.1f}%, ${ask-bid:.2f} abs): {result} (expected {expected})")
+        ok, details = spread_ok(bid, ask, rules)
+        status = "✅" if ok == expected else "❌"
+        logger.info(
+            f"  {status} bid=${bid:.2f} ask=${ask:.2f} "
+            f"({details['spread_pct']:.1f}%, ${details['spread_abs']:.2f} abs, cap=${details['abs_cap_used']:.2f}): "
+            f"{ok} (expected {expected})"
+        )
 
     logger.info("\n✅ All tests passed!")
