@@ -5,6 +5,7 @@ Runs daily to populate iv_snapshots table for use by weekly_screener.
 from __future__ import annotations
 
 from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
 import csv
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -19,7 +20,6 @@ load_dotenv(".env.local")
 from wheel.clients.schwab_marketdata_client import SchwabMarketDataClient
 from wheel.clients.supabase_client import get_supabase, upsert_rows
 from apps.worker.src.config.wheel_rules import load_wheel_rules
-import pytz
 
 
 def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
@@ -207,7 +207,7 @@ def main() -> None:
         MAX_SYMBOLS = int(os.getenv("WHEEL_IV_SNAPSHOT_MAX_SYMBOLS", "0")) or None  # 0 means no limit
         
         # Get today's date in America/Los_Angeles timezone
-        la_tz = pytz.timezone("America/Los_Angeles")
+        la_tz = ZoneInfo("America/Los_Angeles")
         asof_date = datetime.now(la_tz).date()
         logger.info(f"IV Snapshot run for asof_date={asof_date.isoformat()}")
         
@@ -362,4 +362,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
