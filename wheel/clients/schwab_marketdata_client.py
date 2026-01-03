@@ -110,19 +110,91 @@ class SchwabMarketDataClient:
 
         return r.json()
 
-    def get_option_chain(self, symbol: str, *, contract_type: str = "PUT", strike_count: int = 50) -> Any:
+    def get_option_chain(self, symbol: str, **kwargs) -> dict:
         """
-        Schwab option chain endpoint.
-        We keep params minimal + robust.
+        Schwab option chain endpoint with robust parameter handling.
+        
+        Uses minimal known-good parameter set first, with fallback on 400 errors.
+        
+        Args:
+            symbol: Stock symbol (e.g., "AAPL")
+            **kwargs: Optional parameters (for future extensibility)
+            
+        Returns:
+            Dictionary with option chain data, or {} if empty/no data
         """
-        # Common query params (best-effort; Schwab params may evolve)
+        token = self._get_bearer_token()
+        url = f"{self.BASE_URL}/marketdata/v1/chains"
+        
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        
+        # Known-good minimal parameter set
         params = {
             "symbol": symbol,
-            "contractType": contract_type,  # "PUT" for CSPs
-            "strikeCount": strike_count,
-            # You can optionally add these later:
-            # "includeQuotes": "TRUE",
-            # "strategy": "SINGLE",
+            "includeUnderlyingQuote": "true",
+            "strategy": "SINGLE",
+            "contractType": "PUT",
         }
-        return self._request("GET", "/marketdata/v1/chains", params=params)
-
+        
+        # Apply any additional kwargs
+        params.update(kwargs)
+        
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=30)
+            
+            if r.status_code == 400:
+                # Log warning with params (safe; not secret)
+                logger.warning(
+                    f"Schwab option chain 400 error for {symbol}, retrying with minimal params. "
+                    f"Original params: {params}"
+                )
+                
+                # Retry with minimal fallback params
+                fallback_params = {
+                    "symbol": symbol,
+                    "includeUnderlyingQuote": "true",
+                }
+                
+                r = requests.get(url, headers=headers, params=fallback_params, timeout=30)
+                
+                if r.status_code == 400:
+                    # Fallback also failed, raise the error
+                    logger.error(
+                        f"Schwab option chain 400 error for {symbol} even with minimal params. "
+                        f"body={r.text[:500]}"
+                    )
+                    r.raise_for_status()
+            
+            if r.status_code >= 400:
+                logger.error(f"Schwab API error: {r.status_code} {r.reason} | url={url} | body={r.text[:500]}")
+                r.raise_for_status()
+            
+            # Handle empty response
+            if not r.text:
+                logger.debug(f"Schwab option chain empty response for {symbol}")
+                return {}
+            
+            data = r.json()
+            
+            # Check if response has any option data
+            if isinstance(data, dict):
+                # Check for common option data keys
+                has_data = any(
+                    key in data 
+                    for key in ("putExpDateMap", "callExpDateMap", "expirations", "expirationDates", "puts", "calls")
+                )
+                if not has_data:
+                    logger.debug(f"Schwab option chain response for {symbol} has no option data (keys: {list(data.keys())[:10]})")
+                    return {}
+            
+            return data if isinstance(data, dict) else {}
+            
+        except requests.HTTPError as e:
+            # Re-raise HTTP errors (already logged above)
+            raise
+        except Exception as e:
+            logger.error(f"Schwab option chain unexpected error for {symbol}: {e}")
+            raise
