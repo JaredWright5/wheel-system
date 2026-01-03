@@ -947,6 +947,51 @@ def main() -> None:
         )
         # Don't raise error - allow the run to complete with 0 picks for visibility
 
+    # Compute display_score (percentile rank of chosen_total_score) for each pick
+    if pick_rows:
+        # Extract chosen_total_score from metadata for each pick
+        scores_with_indices = []
+        for idx, pick in enumerate(pick_rows):
+            metadata = pick.get("pick_metrics", {}).get("metadata", {})
+            chosen_total_score = metadata.get("chosen_total_score")
+            if chosen_total_score is not None:
+                scores_with_indices.append((idx, chosen_total_score))
+        
+        if scores_with_indices:
+            # Sort by chosen_total_score ascending (lowest first, highest last)
+            scores_with_indices.sort(key=lambda x: x[1])
+            n = len(scores_with_indices)
+            
+            # Compute percentile rank for each pick (best = 100, worst = 0)
+            # For n=1, assign score of 100 (or 50, but 100 makes more sense for "best")
+            if n == 1:
+                idx = scores_with_indices[0][0]
+                pick_rows[idx]["pick_metrics"]["metadata"]["display_score"] = 100.0
+            else:
+                # Map to percentile: position 0 gets 0, position n-1 gets 100
+                # percentile = (position / (n - 1)) * 100
+                for position, (idx, _) in enumerate(scores_with_indices):
+                    percentile = (position / (n - 1)) * 100.0
+                    pick_rows[idx]["pick_metrics"]["metadata"]["display_score"] = percentile
+        
+        # Log picks with display_score
+        logger.info("Picks with display_score (percentile rank):")
+        for pick in pick_rows:
+            ticker = pick.get("ticker")
+            metadata = pick.get("pick_metrics", {}).get("metadata", {})
+            display_score = metadata.get("display_score")
+            chosen_total_score = metadata.get("chosen_total_score")
+            exp = pick.get("expiration")
+            strike = pick.get("strike")
+            delta = pick.get("delta")
+            ann_yld = pick.get("annualized_yield")
+            if display_score is not None:
+                logger.info(
+                    f"  {ticker}: display_score={display_score:.1f} | "
+                    f"exp={exp} | strike={strike} | delta={delta:.3f} | "
+                    f"yield={ann_yld:.2%} | total_score={chosen_total_score:.4f}"
+                )
+
     # 3) Delete existing CSP picks for this run_id, then insert new ones
     # (This ensures idempotent reruns)
     logger.info(f"Deleting existing CSP picks for run_id={run_id}")
