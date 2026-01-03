@@ -48,6 +48,7 @@ class WheelRules:
     MAX_SPREAD_PCT: float = float(os.getenv("WHEEL_MAX_SPREAD_PCT", "7.5"))
     MIN_OPEN_INTEREST: int = int(os.getenv("WHEEL_MIN_OPEN_INTEREST", "10"))
     MIN_BID: float = float(os.getenv("WHEEL_MIN_BID", "0.05"))
+    MIN_CREDIT: float = float(os.getenv("WHEEL_MIN_CREDIT", "0.25"))  # Minimum credit/premium - credit below this is usually not worth the assignment risk / transaction costs
     MAX_ABS_SPREAD_LOW_PREMIUM: float = float(os.getenv("WHEEL_MAX_ABS_SPREAD_LOW_PREMIUM", "0.10"))   # if mid < 1.00
     MAX_ABS_SPREAD_HIGH_PREMIUM: float = float(os.getenv("WHEEL_MAX_ABS_SPREAD_HIGH_PREMIUM", "0.25"))  # if mid >= 1.00
 
@@ -112,6 +113,10 @@ class WheelRules:
         return self.MIN_BID
 
     @property
+    def min_credit(self) -> float:
+        return self.MIN_CREDIT
+
+    @property
     def max_abs_spread_low_premium(self) -> float:
         return self.MAX_ABS_SPREAD_LOW_PREMIUM
 
@@ -141,6 +146,8 @@ class WheelRules:
             raise ValueError("MIN_OPEN_INTEREST cannot be negative")
         if self.MIN_BID < 0:
             raise ValueError("MIN_BID cannot be negative")
+        if self.MIN_CREDIT < 0:
+            raise ValueError("MIN_CREDIT cannot be negative")
         if self.MAX_ABS_SPREAD_LOW_PREMIUM < 0:
             raise ValueError("MAX_ABS_SPREAD_LOW_PREMIUM cannot be negative")
         if self.MAX_ABS_SPREAD_HIGH_PREMIUM < 0:
@@ -349,7 +356,7 @@ if __name__ == "__main__":
     logger.info(f"  Earnings Avoid Days: {rules.earnings_avoid_days}")
     logger.info(f"  RSI Period: {rules.rsi_period}, Interval: {rules.rsi_interval}")
     logger.info(f"  Allow Fallback DTE: {rules.allow_fallback_dte}")
-    logger.info(f"  Liquidity: max_spread_pct={rules.max_spread_pct}%, min_oi={rules.min_open_interest}, min_bid=${rules.min_bid:.2f}")
+    logger.info(f"  Liquidity: max_spread_pct={rules.max_spread_pct}%, min_oi={rules.min_open_interest}, min_bid=${rules.min_bid:.2f}, min_credit=${rules.min_credit:.2f}")
     logger.info(f"  Liquidity: max_abs_spread_low=${rules.max_abs_spread_low_premium:.2f}, max_abs_spread_high=${rules.max_abs_spread_high_premium:.2f}")
 
     # Test is_within_dte_window
