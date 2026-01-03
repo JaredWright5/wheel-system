@@ -3,39 +3,31 @@ Symbol normalization utilities for cross-provider matching.
 
 Provides functions to normalize equity symbols and convert between different
 provider formats (FMP API, universe CSV, etc.).
+
+Canonical form uses dot notation for class shares (e.g., "BRK.B", "BF.B").
 """
-from typing import Dict
+from typing import Set
 
 
-# Mapping of known tickers that require special handling for class shares
-# Format: {fmp_format: universe_format}
-_CLASS_SHARE_MAPPING: Dict[str, str] = {
-    "BRK-B": "BRK.B",
-    "BF-B": "BF.B",
-    # Add more as needed
-}
-
-# Reverse mapping for universe -> FMP
-_FMP_MAPPING: Dict[str, str] = {v: k for k, v in _CLASS_SHARE_MAPPING.items()}
+# Known class share tickers that require special handling
+_CLASS_SHARE_TICKERS: Set[str] = {"BRK", "BF"}
 
 
 def normalize_equity_symbol(symbol: str) -> str:
     """
-    Normalize an equity symbol to a canonical form.
+    Normalize an equity symbol to canonical form.
     
-    This function creates a standard representation of a stock symbol that can be
-    used for matching across different providers. The canonical form uses dot notation
-    for class shares (e.g., "BRK.B").
+    Canonical form uses dot notation for class shares (e.g., "BRK.B", "BF.B").
     
     Steps:
-    1. Trim whitespace
-    2. Convert to uppercase
-    3. Convert class-share separators to canonical form (BRK-B -> BRK.B)
-    4. Convert "/" to "." (handles edge cases)
-    5. Leave other characters as-is
+    1. Strip whitespace and convert to uppercase
+    2. Replace "-" class share separator with "." ONLY for known class share tickers
+       (BRK-B -> BRK.B, BF-B -> BF.B)
+    3. Replace "/" with "." (handles rare edge cases)
+    4. Return result
     
     Args:
-        symbol: Stock symbol in any format (e.g., "BRK-B", "BRK.B", "brk.b")
+        symbol: Stock symbol in any format (e.g., "BRK-B", "BRK.B", "brk-b")
         
     Returns:
         Canonical symbol (e.g., "BRK.B", "AAPL")
@@ -53,43 +45,42 @@ def normalize_equity_symbol(symbol: str) -> str:
     if not symbol:
         return symbol
     
-    # Trim whitespace and uppercase
+    # Strip and uppercase
     normalized = symbol.strip().upper()
     
-    # Convert "/" to "." (handles edge cases)
+    # Replace "/" with "." (rare edge cases)
     normalized = normalized.replace("/", ".")
     
-    # Convert known class-share formats to canonical form (hyphen -> dot)
-    # Check if it matches any FMP format in our mapping
-    if normalized in _CLASS_SHARE_MAPPING:
-        return _CLASS_SHARE_MAPPING[normalized]
-    
-    # If it's already in universe format, return as-is
-    if normalized in _FMP_MAPPING:
-        return normalized
-    
-    # For unknown patterns, check if it has a hyphen that might be a class share
-    # We'll be conservative and only convert known patterns
-    # This leaves other symbols unchanged
+    # Replace "-" with "." ONLY for known class share tickers
+    if "-" in normalized:
+        ticker_base = normalized.split("-")[0]
+        if ticker_base in _CLASS_SHARE_TICKERS:
+            normalized = normalized.replace("-", ".")
     
     return normalized
 
 
 def to_fmp_symbol(symbol: str) -> str:
     """
-    Convert a canonical symbol to FMP API format.
+    Convert a symbol to FMP API format.
     
     FMP API expects class shares with hyphens (e.g., "BRK-B" instead of "BRK.B").
-    This function converts canonical symbols to the format expected by FMP.
+    
+    Steps:
+    1. Normalize to canonical form first
+    2. For known class shares, convert "." to "-" (BRK.B -> BRK-B, BF.B -> BF-B)
+    3. Otherwise return normalized symbol
     
     Args:
-        symbol: Canonical symbol (e.g., "BRK.B", "AAPL")
+        symbol: Symbol in any format (e.g., "BRK.B", "BRK-B", "AAPL")
         
     Returns:
         FMP-formatted symbol (e.g., "BRK-B", "AAPL")
         
     Examples:
         >>> to_fmp_symbol("BRK.B")
+        'BRK-B'
+        >>> to_fmp_symbol("BRK-B")
         'BRK-B'
         >>> to_fmp_symbol("AAPL")
         'AAPL'
@@ -99,20 +90,29 @@ def to_fmp_symbol(symbol: str) -> str:
     if not symbol:
         return symbol
     
-    # Normalize first to ensure we're working with canonical form
-    canonical = normalize_equity_symbol(symbol)
+    # Normalize first to ensure canonical form
+    normalized = normalize_equity_symbol(symbol)
     
-    # Convert to FMP format if we have a mapping
-    return _FMP_MAPPING.get(canonical, canonical)
+    # Convert "." to "-" for known class share tickers
+    if "." in normalized:
+        ticker_base = normalized.split(".")[0]
+        if ticker_base in _CLASS_SHARE_TICKERS:
+            normalized = normalized.replace(".", "-")
+    
+    return normalized
 
 
 def to_universe_symbol(symbol: str) -> str:
     """
     Convert a symbol to universe format (canonical form with dot notation).
     
-    Universe symbols (e.g., from CSV files) use dot notation for class shares
-    (e.g., "BRK.B"). This function converts FMP format or other formats to
-    the canonical universe format.
+    Universe symbols use dot notation for class shares (e.g., "BRK.B").
+    This function converts any format to the canonical universe format.
+    
+    Steps:
+    1. Uppercase and strip
+    2. For known class shares, convert "-" to "." (BRK-B -> BRK.B, BF-B -> BF.B)
+    3. Otherwise return symbol
     
     Args:
         symbol: Symbol in any format (e.g., "BRK-B", "BRK.B", "AAPL")
@@ -127,65 +127,62 @@ def to_universe_symbol(symbol: str) -> str:
         'BRK.B'
         >>> to_universe_symbol("AAPL")
         'AAPL'
+        >>> to_universe_symbol("BF-B")
+        'BF.B'
     """
     if not symbol:
         return symbol
     
-    # Normalize to canonical form (which uses dot notation)
-    return normalize_equity_symbol(symbol)
+    # Uppercase and strip
+    normalized = symbol.strip().upper()
+    
+    # Convert "-" to "." for known class share tickers
+    if "-" in normalized:
+        ticker_base = normalized.split("-")[0]
+        if ticker_base in _CLASS_SHARE_TICKERS:
+            normalized = normalized.replace("-", ".")
+    
+    return normalized
 
 
 if __name__ == "__main__":
-    # Self-test
-    from loguru import logger
+    # Self-test with assertions
+    print("Testing normalize_equity_symbol:")
+    assert normalize_equity_symbol("BRK-B") == "BRK.B"
+    assert normalize_equity_symbol("BRK.B") == "BRK.B"
+    assert normalize_equity_symbol("brk-b") == "BRK.B"
+    assert normalize_equity_symbol("brk.b") == "BRK.B"
+    assert normalize_equity_symbol("  BRK-B  ") == "BRK.B"
+    assert normalize_equity_symbol("BF-B") == "BF.B"
+    assert normalize_equity_symbol("BF.B") == "BF.B"
+    assert normalize_equity_symbol("AAPL") == "AAPL"
+    assert normalize_equity_symbol("  aapl  ") == "AAPL"
+    assert normalize_equity_symbol("MSFT") == "MSFT"
+    assert normalize_equity_symbol("") == ""
+    # Test that unknown tickers with hyphens are NOT converted
+    assert normalize_equity_symbol("TEST-TICKER") == "TEST-TICKER"
+    print("  ✅ All normalize_equity_symbol tests passed")
     
-    logger.info("Testing normalize_equity_symbol:")
-    test_cases_normalize = [
-        ("BRK-B", "BRK.B"),
-        ("BRK.B", "BRK.B"),
-        ("brk-b", "BRK.B"),
-        ("brk.b", "BRK.B"),
-        ("  BRK-B  ", "BRK.B"),
-        ("BF-B", "BF.B"),
-        ("BF.B", "BF.B"),
-        ("AAPL", "AAPL"),
-        ("  aapl  ", "AAPL"),
-        ("MSFT", "MSFT"),
-        ("", ""),
-    ]
-    for original, expected in test_cases_normalize:
-        result = normalize_equity_symbol(original)
-        status = "✅" if result == expected else "❌"
-        logger.info(f"  {status} '{original}' -> '{result}' (expected '{expected}')")
-        assert result == expected, f"Failed: '{original}' -> '{result}' (expected '{expected}')"
+    print("\nTesting to_fmp_symbol:")
+    assert to_fmp_symbol("BRK.B") == "BRK-B"
+    assert to_fmp_symbol("BRK-B") == "BRK-B"  # Already normalized
+    assert to_fmp_symbol("bf.b") == "BF-B"
+    assert to_fmp_symbol("BF-B") == "BF-B"
+    assert to_fmp_symbol("AAPL") == "AAPL"
+    assert to_fmp_symbol("") == ""
+    # Test that unknown tickers with dots are NOT converted
+    assert to_fmp_symbol("TEST.TICKER") == "TEST.TICKER"
+    print("  ✅ All to_fmp_symbol tests passed")
     
-    logger.info("\nTesting to_fmp_symbol:")
-    test_cases_fmp = [
-        ("BRK.B", "BRK-B"),
-        ("BRK-B", "BRK-B"),  # Already in FMP format, normalize first
-        ("BF.B", "BF-B"),
-        ("AAPL", "AAPL"),
-        ("", ""),
-    ]
-    for original, expected in test_cases_fmp:
-        result = to_fmp_symbol(original)
-        status = "✅" if result == expected else "❌"
-        logger.info(f"  {status} '{original}' -> '{result}' (expected '{expected}')")
-        assert result == expected, f"Failed: '{original}' -> '{result}' (expected '{expected}')"
+    print("\nTesting to_universe_symbol:")
+    assert to_universe_symbol("BRK-B") == "BRK.B"
+    assert to_universe_symbol("BRK.B") == "BRK.B"
+    assert to_universe_symbol("bf-b") == "BF.B"
+    assert to_universe_symbol("BF.B") == "BF.B"
+    assert to_universe_symbol("AAPL") == "AAPL"
+    assert to_universe_symbol("") == ""
+    # Test that unknown tickers with hyphens are NOT converted
+    assert to_universe_symbol("TEST-TICKER") == "TEST-TICKER"
+    print("  ✅ All to_universe_symbol tests passed")
     
-    logger.info("\nTesting to_universe_symbol:")
-    test_cases_universe = [
-        ("BRK-B", "BRK.B"),
-        ("BRK.B", "BRK.B"),
-        ("BF-B", "BF.B"),
-        ("BF.B", "BF.B"),
-        ("AAPL", "AAPL"),
-        ("", ""),
-    ]
-    for original, expected in test_cases_universe:
-        result = to_universe_symbol(original)
-        status = "✅" if result == expected else "❌"
-        logger.info(f"  {status} '{original}' -> '{result}' (expected '{expected}')")
-        assert result == expected, f"Failed: '{original}' -> '{result}' (expected '{expected}')"
-    
-    logger.info("\n✅ All tests passed")
+    print("\n✅ All tests passed")
