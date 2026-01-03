@@ -119,51 +119,50 @@ def _extract_put_options_for_exp(chain: Dict[str, Any], exp: date) -> List[Dict[
     return results
 
 
-def _check_liquidity(option: Dict[str, Any], rules) -> Tuple[bool, Optional[str]]:
+def _check_liquidity(option: Dict[str, Any], rules) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
     """
     Check if option meets liquidity requirements using WheelRules.
     
     Returns:
-        (is_valid, reason_if_invalid)
+        (is_valid, reason_if_invalid, spread_details)
+        spread_details is None if spread check fails early, otherwise contains spread info
     """
     bid = _safe_float(option.get("bid"), 0.0) or 0.0
     ask = _safe_float(option.get("ask"), 0.0) or 0.0
     
     # Require bid >= MIN_CREDIT (stricter than MIN_BID, so this is the effective check)
     if bid < rules.min_credit:
-        return False, f"bid_below_min_credit_{bid:.2f}"
+        return False, f"bid_below_min_credit_{bid:.2f}", None
     
     # Require non-null ask
     if ask <= 0:
-        return False, "missing_ask"
+        return False, "missing_ask", None
     
-    # Check spread using wheel_rules.spread_ok()
-    if not spread_ok(
-        bid=bid,
-        ask=ask,
-        max_spread_pct=rules.max_spread_pct,
-        max_abs_low=rules.max_abs_spread_low_premium,
-        max_abs_high=rules.max_abs_spread_high_premium,
-    ):
+    # Check spread using wheel_rules.spread_ok() - new signature returns (ok, details)
+    spread_ok_result, spread_details = spread_ok(bid=bid, ask=ask, rules=rules)
+    if not spread_ok_result:
         # Determine specific failure reason for logging
-        mid = (bid + ask) / 2.0
-        abs_spread = ask - bid
-        pct_spread = (abs_spread / mid) * 100.0 if mid > 0 else 0.0
-        max_abs = rules.max_abs_spread_low_premium if mid < 1.00 else rules.max_abs_spread_high_premium
-        
-        if pct_spread > rules.max_spread_pct:
-            return False, f"spread_pct_fail_{pct_spread:.1f}%"
-        elif abs_spread > max_abs:
-            return False, f"spread_abs_fail_{abs_spread:.2f}"
+        if spread_details and spread_details.get("mid") is not None:
+            mid = spread_details["mid"]
+            abs_spread = spread_details["spread_abs"]
+            pct_spread = spread_details["spread_pct"]
+            abs_cap = spread_details["abs_cap_used"]
+            
+            if pct_spread > rules.max_spread_pct:
+                return False, f"spread_pct_fail_{pct_spread:.1f}%", spread_details
+            elif abs_spread > abs_cap:
+                return False, f"spread_abs_fail_{abs_spread:.2f}", spread_details
+            else:
+                return False, "spread_fail", spread_details
         else:
-            return False, "spread_fail"
+            return False, "spread_fail", spread_details
     
     # Check open interest
     oi = _safe_float(option.get("openInterest"), 0.0) or 0.0
     if oi < rules.min_open_interest:
-        return False, f"low_oi_{int(oi)}"
+        return False, f"low_oi_{int(oi)}", spread_details
     
-    return True, None
+    return True, None, spread_details
 
 
 def _count_put_contracts_diagnostics(
@@ -203,16 +202,11 @@ def _count_put_contracts_diagnostics(
         if bid >= rules.min_credit:
             counts["bid_ok"] += 1
             
-            # Count spread OK (only if bid >= MIN_BID)
+            # Count spread OK (only if bid >= MIN_CREDIT)
             ask = _safe_float(o.get("ask"), 0.0) or 0.0
             if ask > 0:
-                if spread_ok(
-                    bid=bid,
-                    ask=ask,
-                    max_spread_pct=rules.max_spread_pct,
-                    max_abs_low=rules.max_abs_spread_low_premium,
-                    max_abs_high=rules.max_abs_spread_high_premium,
-                ):
+                spread_ok_result, _ = spread_ok(bid=bid, ask=ask, rules=rules)
+                if spread_ok_result:
                     counts["spread_ok"] += 1
                     
                     # Count OI OK (only if spread OK)
@@ -259,7 +253,7 @@ def _choose_best_put_in_delta_band(
             continue
 
         # Check liquidity
-        is_liquid, liquidity_reason = _check_liquidity(o, rules)
+        is_liquid, liquidity_reason, spread_details = _check_liquidity(o, rules)
         if not is_liquid:
             continue  # Skip but don't log here (too verbose)
 
@@ -393,6 +387,10 @@ def _find_best_in_delta_contract(puts: List[Dict[str, Any]], target_delta_low: f
         
         spread_pct = (abs_spread / mid) * 100.0 if mid > 0 else float('inf')
         
+        # Get spread_details to include abs_cap_used
+        _, spread_details = spread_ok(bid=bid, ask=ask, rules=rules)
+        abs_cap_used = spread_details.get("abs_cap_used") if spread_details else None
+        
         # Track the contract with tightest spread
         if spread_pct < best_spread_pct:
             best_spread_pct = spread_pct
@@ -405,6 +403,7 @@ def _find_best_in_delta_contract(puts: List[Dict[str, Any]], target_delta_low: f
                 "strike": strike,
                 "exp": expiration.isoformat(),
                 "delta": d,
+                "abs_cap_used": abs_cap_used,
             }
     
     return best_in_delta
@@ -509,8 +508,10 @@ def main() -> None:
         f"earnings_avoid_days={rules.earnings_avoid_days}, "
         f"liquidity: max_spread_pct={rules.max_spread_pct}%, "
         f"min_bid=${rules.min_bid:.2f}, min_credit=${rules.min_credit:.2f}, min_oi={rules.min_open_interest}, "
-        f"max_abs_spread_low=${rules.max_abs_spread_low_premium:.2f}, "
-        f"max_abs_spread_high=${rules.max_abs_spread_high_premium:.2f}"
+        f"spread_tiers: Tier1(mid<${rules.SPREAD_TIER_1_MAX_MID:.2f})=${rules.SPREAD_TIER_1_MAX_ABS:.2f}, "
+        f"Tier2(mid<${rules.SPREAD_TIER_2_MAX_MID:.2f})=${rules.SPREAD_TIER_2_MAX_ABS:.2f}, "
+        f"Tier3(mid<${rules.SPREAD_TIER_3_MAX_MID:.2f})=${rules.SPREAD_TIER_3_MAX_ABS:.2f}, "
+        f"Tier4(mid>=${rules.SPREAD_TIER_3_MAX_MID:.2f})=${rules.SPREAD_TIER_4_MAX_ABS:.2f}"
     )
 
     sb = get_supabase()
@@ -825,6 +826,7 @@ def main() -> None:
                     # If spread failed, include best in-delta contract details
                     if "spread" in skip_reason.lower() and "best_in_delta" in diag_to_log:
                         best_in_delta = diag_to_log["best_in_delta"]
+                        abs_cap_used = best_in_delta.get('abs_cap_used')
                         log_msg += (
                             f" | best_in_delta: exp={best_in_delta.get('exp')} "
                             f"strike={best_in_delta.get('strike')} "
@@ -833,6 +835,8 @@ def main() -> None:
                             f"spread_pct={best_in_delta.get('spread_pct', 0):.2f}% "
                             f"spread_abs=${best_in_delta.get('spread_abs', 0):.2f}"
                         )
+                        if abs_cap_used is not None:
+                            log_msg += f" abs_cap=${abs_cap_used:.2f}"
                 
                 # If fallback was attempted, include fallback diagnostics
                 if fallback_attempted:
@@ -874,18 +878,24 @@ def main() -> None:
             liquidity_bonus = max(0.0, (0.05 - spread_pct) * 100.0)
             total_score = contract_score + liquidity_bonus
 
-            # Check liquidity pass status for metadata
+            # Check liquidity pass status for metadata using new spread_ok signature
             min_bid_ok = bid >= rules.min_bid
             spread_ok_status = False
+            spread_details_for_metadata = None
             if min_bid_ok and ask > 0:
-                spread_ok_status = spread_ok(
-                    bid=bid,
-                    ask=ask,
-                    max_spread_pct=rules.max_spread_pct,
-                    max_abs_low=rules.max_abs_spread_low_premium,
-                    max_abs_high=rules.max_abs_spread_high_premium,
-                )
+                spread_ok_status, spread_details_for_metadata = spread_ok(bid=bid, ask=ask, rules=rules)
             oi_ok = oi >= rules.min_open_interest
+            
+            # Ensure spread_details match what we computed (use from spread_ok if available, otherwise compute)
+            if spread_details_for_metadata:
+                # Use values from spread_ok for consistency
+                mid = spread_details_for_metadata.get("mid", mid)
+                spread_abs = spread_details_for_metadata.get("spread_abs", spread_abs)
+                spread_pct = spread_details_for_metadata.get("spread_pct", spread_pct)
+                abs_cap_used = spread_details_for_metadata.get("abs_cap_used")
+            else:
+                # Fallback to computed values if spread_ok didn't return details
+                abs_cap_used = None
 
             # Log successful pick with contract_score
             logger.info(
@@ -919,6 +929,7 @@ def main() -> None:
                 "chosen_contract_score": contract_score,
                 "chosen_total_score": total_score,
                 "chosen_liquidity_bonus": liquidity_bonus,
+                "abs_cap_used": abs_cap_used,  # Store the tiered absolute spread cap that was applied
             }
             
             # Add comparison data if available
@@ -974,6 +985,7 @@ def main() -> None:
                         "mid": mid,
                         "spread_abs": spread_abs,
                         "spread_pct": spread_pct,
+                        "abs_cap_used": abs_cap_used,  # Tiered absolute spread cap applied
                         "annualized_yield": ann_yld,
                         "contract_score": contract_score,
                         "total_score": total_score,
