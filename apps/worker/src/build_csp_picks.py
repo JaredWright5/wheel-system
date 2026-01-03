@@ -30,8 +30,9 @@ load_dotenv(".env.local")
 # Allow env override of run_id for reruns
 RUN_ID = os.getenv("RUN_ID")  # None = use latest
 
-# Number of candidates to process (default 25)
-PICKS_N = int(os.getenv("PICKS_N", "25"))
+# Target-based pick generation parameters
+CSP_MAX_CANDIDATES_TO_SCAN = int(os.getenv("CSP_MAX_CANDIDATES_TO_SCAN", "100"))
+CSP_TARGET_PICKS = int(os.getenv("CSP_TARGET_PICKS", "10"))
 
 # Maximum annualized yield (as decimal, e.g., 3.0 = 300%)
 MAX_ANNUALIZED_YIELD = float(os.getenv("MAX_ANNUALIZED_YIELD", "3.0"))
@@ -477,13 +478,13 @@ def main() -> None:
         run_id = runs[0]["run_id"]
         logger.info(f"Using latest successful screening run_id: {run_id} (run_ts={runs[0].get('run_ts')})")
 
-    # 2) Get top candidates for that run
+    # 2) Get top candidates for that run (up to max scan limit)
     cands = (
         sb.table("screening_candidates")
         .select("*")
         .eq("run_id", run_id)
         .order("score", desc=True)
-        .limit(PICKS_N)
+        .limit(CSP_MAX_CANDIDATES_TO_SCAN)
         .execute()
         .data
         or []
@@ -508,7 +509,10 @@ def main() -> None:
         else:
             raise RuntimeError(f"Run_id {run_id} not found in screening_runs table.")
 
-    logger.info(f"Processing {len(cands)} candidates for run_id={run_id}")
+    logger.info(
+        f"Target-based pick generation: scanning up to {len(cands)} candidates "
+        f"(max_scan={CSP_MAX_CANDIDATES_TO_SCAN}) to create {CSP_TARGET_PICKS} picks for run_id={run_id}"
+    )
 
     md = SchwabMarketDataClient()
 
@@ -531,10 +535,21 @@ def main() -> None:
 
     now = datetime.now(timezone.utc).date()
 
+    scanned_candidates = 0
     for i, c in enumerate(cands, start=1):
+        # Stop early if we've reached the target number of picks
+        if len(pick_rows) >= CSP_TARGET_PICKS:
+            logger.info(
+                f"Target reached: created {len(pick_rows)} picks (target={CSP_TARGET_PICKS}). "
+                f"Stopping scan after {scanned_candidates} candidates."
+            )
+            break
+        
         ticker = c.get("ticker")
         if not ticker:
             continue
+
+        scanned_candidates += 1
 
         try:
             # Load earnings_in_days from column or metrics JSON
@@ -845,7 +860,8 @@ def main() -> None:
     # Log summary with skip counts by reason
     logger.info(
         f"Pick generation summary: "
-        f"processed={len(cands)}, "
+        f"scanned_candidates={scanned_candidates}, "
+        f"target_picks={CSP_TARGET_PICKS}, "
         f"created={len(pick_rows)}, "
         f"skipped_earnings_blocked={skipped_earnings_blocked}, "
         f"earnings_known={earnings_known}, earnings_unknown={earnings_unknown}, "
@@ -860,7 +876,11 @@ def main() -> None:
     )
 
     if not pick_rows:
-        raise RuntimeError("No CSP picks were generated. Check chain parsing / auth / delta availability.")
+        logger.warning(
+            f"No CSP picks were generated after scanning {scanned_candidates} candidates. "
+            f"Check chain parsing / auth / delta availability."
+        )
+        # Don't raise error - allow the run to complete with 0 picks for visibility
 
     # 3) Delete existing CSP picks for this run_id, then insert new ones
     # (This ensures idempotent reruns)
