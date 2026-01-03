@@ -919,10 +919,11 @@ def main() -> None:
             oi = _safe_float(best.get("openInterest"), 0.0) or 0.0
 
             # Use spread_ok() as single source of truth for spread values
+            # Always call spread_ok() when we have valid bid/ask (contracts that pass all checks should have this)
             min_bid_ok = bid >= rules.min_bid
             spread_ok_status = False
             spread_details_for_metadata = None
-            if min_bid_ok and ask > 0:
+            if bid > 0 and ask > 0:
                 spread_ok_status, spread_details_for_metadata = spread_ok(bid=bid, ask=ask, rules=rules)
             
             # Extract spread values from spread_details (single source of truth)
@@ -932,12 +933,12 @@ def main() -> None:
                 spread_pct = spread_details_for_metadata["spread_pct"]
                 abs_cap_used = spread_details_for_metadata.get("abs_cap_used")
             else:
-                # Fallback if spread_ok didn't return valid details (shouldn't happen for valid contracts)
-                mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else premium
-                spread_abs = ask - bid if (ask > bid) else 0.0
-                spread_pct = (spread_abs / mid) * 100.0 if mid > 0 else 0.0
+                # This should not happen for valid contracts - log error and use stored values as last resort
+                logger.error(f"{ticker}: spread_details missing from spread_ok() - using stored values from contract")
+                mid = _safe_float(best.get("_mid")) or ((bid + ask) / 2.0 if (bid > 0 and ask > 0) else premium)
+                spread_abs = _safe_float(best.get("_spread_abs")) or 0.0
+                spread_pct = _safe_float(best.get("_spread_pct")) or 0.0
                 abs_cap_used = None
-                logger.warning(f"{ticker}: spread_details missing, using fallback calculation")
 
             oi_ok = oi >= rules.min_open_interest
 
