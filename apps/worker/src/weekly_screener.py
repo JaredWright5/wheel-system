@@ -13,7 +13,6 @@ from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 from loguru import logger
 import os
-import time
 
 # Load environment variables
 load_dotenv(".env.local")
@@ -138,155 +137,164 @@ def build_universe_fmp_stable(
     return filtered
 
 
-def fetch_earnings_calendar_batch(
-    fmp: FMPStableClient,
-    symbols: List[str],
-) -> Dict[str, Tuple[Optional[date], str]]:
+def _denormalize_symbol_from_fmp(fmp_symbol: str, universe_symbols: set) -> str:
     """
-    Fetch earnings calendar data for multiple symbols.
-    Tries batch endpoint first, then falls back to per-symbol calls with rate limiting.
+    Convert FMP symbol format back to universe format if needed.
     
-    Returns:
-        Dictionary mapping symbol -> (earnings_date, source) where source is "fmp" or "unknown"
-    """
-    now = datetime.now(timezone.utc).date()
-    results: Dict[str, Tuple[Optional[date], str]] = {}
-    
-    # Initialize all symbols as unknown
-    for symbol in symbols:
-        results[symbol] = (None, "unknown")
-    
-    # Try batch earnings calendar endpoint (if available)
-    # FMP may support: /stable/earnings-calendar?symbol=AAPL,MSFT,GOOGL
-    try:
-        # Try comma-separated symbols (common pattern for batch endpoints)
-        symbols_str = ",".join([normalize_for_fmp(s) for s in symbols[:100]])  # Limit batch size
-        earnings_cal = fmp._get("earnings-calendar", params={"symbol": symbols_str})
-        
-        if earnings_cal and isinstance(earnings_cal, list):
-            # Process batch results
-            for item in earnings_cal:
-                if not isinstance(item, dict):
-                    continue
-                symbol = item.get("symbol") or item.get("Symbol")
-                if not symbol:
-                    continue
-                
-                earnings_date_str = item.get("date") or item.get("earningsDate") or item.get("reportDate")
-                if earnings_date_str:
-                    try:
-                        if isinstance(earnings_date_str, str):
-                            if "T" in earnings_date_str:
-                                earnings_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
-                            else:
-                                earnings_date = date.fromisoformat(earnings_date_str[:10])
-                            if earnings_date > now:
-                                # Update result if this is the earliest future earnings date
-                                current_date, _ = results.get(symbol, (None, "unknown"))
-                                if current_date is None or earnings_date < current_date:
-                                    results[symbol] = (earnings_date, "fmp")
-                    except Exception:
-                        pass
-            
-            logger.info(f"Fetched earnings calendar batch: {len([d for d, s in results.values() if d is not None])} symbols with earnings dates")
-            # If batch worked for first 100, process remaining symbols per-symbol
-            if len(symbols) > 100:
-                remaining_symbols = symbols[100:]
-                logger.info(f"Processing remaining {len(remaining_symbols)} symbols individually...")
-                per_symbol_results = fetch_earnings_calendar_per_symbol(fmp, remaining_symbols)
-                results.update(per_symbol_results)
-            
-            return results
-    except Exception as e:
-        logger.debug(f"Batch earnings calendar endpoint not available or failed: {e}, falling back to per-symbol calls")
-    
-    # Fallback to per-symbol calls with rate limiting
-    return fetch_earnings_calendar_per_symbol(fmp, symbols)
-
-
-def fetch_earnings_calendar_per_symbol(
-    fmp: FMPStableClient,
-    symbols: List[str],
-    rate_limit_seconds: float = 0.25,  # 4 requests per second max
-) -> Dict[str, Tuple[Optional[date], str]]:
-    """
-    Fetch earnings calendar data per symbol with rate limiting.
+    FMP returns symbols like "BRK-B", but our universe may have "BRK.B".
+    This function tries to match FMP symbols to universe symbols.
     
     Args:
-        fmp: FMP stable client
-        symbols: List of symbols to fetch
-        rate_limit_seconds: Seconds to sleep between requests
+        fmp_symbol: Symbol from FMP (e.g., "BRK-B")
+        universe_symbols: Set of symbols in our universe (e.g., {"BRK.B", "AAPL"})
         
     Returns:
-        Dictionary mapping symbol -> (earnings_date, source)
+        Matched universe symbol if found, otherwise original fmp_symbol
+    """
+    # If exact match, return as-is
+    if fmp_symbol in universe_symbols:
+        return fmp_symbol
+    
+    # Try converting hyphen to dot (BRK-B -> BRK.B)
+    if "-" in fmp_symbol:
+        dot_version = fmp_symbol.replace("-", ".")
+        if dot_version in universe_symbols:
+            return dot_version
+    
+    # Try converting dot to hyphen (BRK.B -> BRK-B) - should not happen but handle it
+    if "." in fmp_symbol:
+        hyphen_version = fmp_symbol.replace(".", "-")
+        if hyphen_version in universe_symbols:
+            return hyphen_version
+    
+    # No match found, return original (will not match to universe)
+    return fmp_symbol
+
+
+def fetch_earnings_calendar_range(
+    client: FMPStableClient,
+    start_date: date,
+    end_date: date,
+    universe_symbols: set,
+) -> Dict[str, date]:
+    """
+    Fetch earnings calendar for a date range and map to universe symbols.
+    
+    Args:
+        client: FMP stable client
+        start_date: Start date (inclusive)
+        end_date: End date (inclusive)
+        universe_symbols: Set of symbols in our universe (for symbol matching)
+        
+    Returns:
+        Dictionary mapping universe symbol -> earliest upcoming earnings date
     """
     now = datetime.now(timezone.utc).date()
-    results: Dict[str, Tuple[Optional[date], str]] = {}
+    earnings_map: Dict[str, date] = {}
     
-    logger.info(f"Fetching earnings calendar for {len(symbols)} symbols (rate-limited)...")
-    
-    for i, symbol in enumerate(symbols):
-        normalized_symbol = normalize_for_fmp(symbol)
-        earnings_date = None
-        source = "unknown"
+    try:
+        # Call FMP earnings calendar endpoint with date range
+        # Common parameters: from=YYYY-MM-DD&to=YYYY-MM-DD
+        params = {
+            "from": start_date.isoformat(),
+            "to": end_date.isoformat(),
+        }
         
-        try:
-            # Try earnings calendar endpoint
-            earnings_cal = fmp._get("earnings-calendar", params={"symbol": normalized_symbol})
+        earnings_cal = client._get("earnings-calendar", params=params)
+        
+        if not earnings_cal:
+            logger.warning("FMP earnings calendar returned empty response")
+            return earnings_map
+        
+        if not isinstance(earnings_cal, list):
+            logger.warning(f"FMP earnings calendar returned non-list response: {type(earnings_cal)}")
+            # Log sample if dict
+            if isinstance(earnings_cal, dict):
+                sample = str(earnings_cal)[:200]
+                logger.debug(f"Sample response (first 200 chars): {sample}")
+            return earnings_map
+        
+        # Log total rows returned
+        total_rows = len(earnings_cal)
+        logger.info(f"FMP earnings calendar returned {total_rows} earnings events")
+        
+        # Parse earnings rows
+        for item in earnings_cal:
+            if not isinstance(item, dict):
+                continue
             
-            if earnings_cal:
-                if isinstance(earnings_cal, list) and earnings_cal:
-                    # Find next future earnings date
-                    for item in earnings_cal:
-                        if not isinstance(item, dict):
-                            continue
-                        earnings_date_str = item.get("date") or item.get("earningsDate") or item.get("reportDate")
-                        if earnings_date_str:
-                            try:
-                                if isinstance(earnings_date_str, str):
-                                    if "T" in earnings_date_str:
-                                        candidate_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
-                                    else:
-                                        candidate_date = date.fromisoformat(earnings_date_str[:10])
-                                    if candidate_date > now:
-                                        if earnings_date is None or candidate_date < earnings_date:
-                                            earnings_date = candidate_date
-                            except Exception:
-                                pass
-                elif isinstance(earnings_cal, dict):
-                    earnings_date_str = earnings_cal.get("date") or earnings_cal.get("earningsDate") or earnings_cal.get("reportDate")
-                    if earnings_date_str:
-                        try:
-                            if isinstance(earnings_date_str, str):
-                                if "T" in earnings_date_str:
-                                    candidate_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
-                                else:
-                                    candidate_date = date.fromisoformat(earnings_date_str[:10])
-                                if candidate_date > now:
-                                    earnings_date = candidate_date
-                        except Exception:
-                            pass
+            # Extract symbol (try multiple field names)
+            fmp_symbol = (
+                item.get("symbol") or
+                item.get("Symbol") or
+                item.get("ticker") or
+                item.get("Ticker") or
+                None
+            )
+            if not fmp_symbol:
+                continue
             
-            if earnings_date:
-                source = "fmp"
-        except Exception as e:
-            # Log debug but don't crash - earnings date is optional
-            logger.debug(f"Failed to fetch earnings for {symbol}: {e}")
+            # Extract earnings date (try multiple field names)
+            earnings_date_str = (
+                item.get("date") or
+                item.get("Date") or
+                item.get("earningsDate") or
+                item.get("EarningsDate") or
+                item.get("reportDate") or
+                item.get("ReportDate") or
+                None
+            )
+            if not earnings_date_str:
+                continue
+            
+            # Parse date
+            try:
+                if isinstance(earnings_date_str, str):
+                    if "T" in earnings_date_str:
+                        earnings_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
+                    else:
+                        earnings_date = date.fromisoformat(earnings_date_str[:10])
+                else:
+                    continue
+            except Exception:
+                continue
+            
+            # Only consider future dates
+            if earnings_date < now:
+                continue
+            
+            # Match FMP symbol to universe symbol (handle BRK-B <-> BRK.B normalization)
+            matched_symbol = _denormalize_symbol_from_fmp(fmp_symbol, universe_symbols)
+            
+            # Skip if symbol not in universe
+            if matched_symbol not in universe_symbols:
+                continue
+            
+            # Store earliest earnings date per symbol
+            if matched_symbol not in earnings_map or earnings_date < earnings_map[matched_symbol]:
+                earnings_map[matched_symbol] = earnings_date
         
-        results[symbol] = (earnings_date, source)
+        unique_symbols = len(earnings_map)
+        logger.info(f"Earnings calendar mapped to {unique_symbols} unique symbols from universe")
         
-        # Rate limiting
-        if i < len(symbols) - 1:  # Don't sleep after last symbol
-            time.sleep(rate_limit_seconds)
+    except Exception as e:
+        # Check if it's a 4xx error (402, 403, etc. - subscription/permission issues)
+        error_str = str(e)
+        if "402" in error_str or "403" in error_str or "4" in error_str[:3]:
+            # Extract response body if available
+            body_sample = error_str[-300:] if len(error_str) > 300 else error_str
+            logger.error(
+                f"FMP earnings calendar returned 4xx error (subscription/permission issue). "
+                f"Setting all earnings as unknown. Error: {body_sample}"
+            )
+        else:
+            # Other errors (network, 5xx, etc.)
+            logger.warning(f"FMP earnings calendar fetch failed: {e}. Setting all earnings as unknown.")
         
-        # Progress logging every 50 symbols
-        if (i + 1) % 50 == 0:
-            logger.info(f"  Processed {i + 1}/{len(symbols)} symbols for earnings calendar")
+        # Return empty map (all earnings will be unknown)
+        return earnings_map
     
-    fetched_count = len([d for d, s in results.values() if d is not None and s == "fmp"])
-    logger.info(f"Fetched earnings calendar: {fetched_count}/{len(symbols)} symbols with earnings dates from FMP")
-    
-    return results
+    return earnings_map
 
 
 def calculate_earnings_in_days(earnings_date: Optional[date], now: Optional[date] = None) -> Optional[int]:
@@ -506,10 +514,14 @@ def main() -> None:
             universe = build_universe_fmp_stable(fmp, MIN_PRICE, MIN_MARKET_CAP, MIN_AVG_VOLUME)
             logger.info(f"Universe size from FMP stable: {len(universe)} (source=fmp_stable)")
         
-        # Fetch earnings calendar data for all symbols in universe
-        universe_symbols = [item.get("symbol") for item in universe if item.get("symbol")]
-        logger.info(f"Fetching earnings calendar data for {len(universe_symbols)} symbols...")
-        earnings_map = fetch_earnings_calendar_batch(fmp, universe_symbols)
+        # Fetch earnings calendar data for date range
+        now = datetime.now(timezone.utc).date()
+        start_date = now
+        end_date = now + timedelta(days=90)
+        universe_symbols = set(item.get("symbol") for item in universe if item.get("symbol"))
+        
+        logger.info(f"Fetching earnings calendar for date range: {start_date.isoformat()} to {end_date.isoformat()}")
+        earnings_map = fetch_earnings_calendar_range(fmp, start_date, end_date, universe_symbols)
         
         # Insert run row with status='running'
         run_row = insert_row("screening_runs", {
@@ -540,8 +552,6 @@ def main() -> None:
         earnings_known = 0
         earnings_unknown = 0
         passed_all_filters = 0
-        
-        now = datetime.now(timezone.utc).date()
 
         for item in universe:
             t = item.get("symbol")
@@ -550,8 +560,9 @@ def main() -> None:
             
             try:
                 # Get earnings data from pre-fetched map
-                next_earnings_date, earnings_source = earnings_map.get(t, (None, "unknown"))
+                next_earnings_date = earnings_map.get(t)
                 earnings_in_days = calculate_earnings_in_days(next_earnings_date, now=now)
+                earnings_source = "fmp_calendar_range" if next_earnings_date is not None else "unknown"
                 
                 # Track earnings statistics
                 if next_earnings_date is not None:
