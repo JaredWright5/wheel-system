@@ -3,6 +3,7 @@ Weekly Screener v2: FMP Stable Universe + Enrichment
 Uses FMP stable endpoints for universe building, fundamentals, technicals, and sentiment.
 Integrates with WheelRules for configurable trading parameters.
 Includes Fundamentals v1 enrichment with financial scores and growth data.
+Includes IV enrichment from Schwab option chain snapshots.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from dotenv import load_dotenv
 from loguru import logger
 import os
 import math
+import statistics
 
 # Load environment variables
 load_dotenv(".env.local")
@@ -376,6 +378,156 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
         return float(x)
     except (ValueError, TypeError):
         return default
+
+
+def get_iv_from_snapshots(
+    ticker: str,
+    lookback_days: int = 252,
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch latest IV snapshot and historical IV series for a ticker.
+    
+    Args:
+        ticker: Stock symbol
+        lookback_days: Number of days to look back for historical series (default 252)
+        
+    Returns:
+        Dict with IV metrics:
+        {
+            "current": float or None,
+            "rank": float or None (0-100),
+            "percentile": float or None (0-100),
+            "zscore": float or None,
+            "asof_date": "YYYY-MM-DD" or None,
+            "exp_date": "YYYY-MM-DD" or None,
+            "dte": int or None,
+            "atm_strike": float or None
+        }
+        Returns None if no IV data found
+    """
+    try:
+        sb = get_supabase()
+        
+        # Get latest snapshot
+        latest_res = sb.table("iv_snapshots").select("*").eq("symbol", ticker).order("asof_date", desc=True).limit(1).execute()
+        
+        if not latest_res.data or len(latest_res.data) == 0:
+            return None
+        
+        latest = latest_res.data[0]
+        iv_current = _safe_float(latest.get("iv"))
+        asof_date = latest.get("asof_date")
+        exp_date = latest.get("exp_date")
+        dte = latest.get("dte")
+        atm_strike = _safe_float(latest.get("strike"))
+        
+        if iv_current is None:
+            return None
+        
+        # Get historical series for lookback window
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).date()
+        
+        history_res = sb.table("iv_snapshots").select("iv, asof_date").eq("symbol", ticker).gte("asof_date", cutoff_date.isoformat()).order("asof_date", desc=False).execute()
+        
+        if not history_res.data or len(history_res.data) < 20:
+            # Too few data points for meaningful statistics
+            return {
+                "current": iv_current,
+                "rank": None,
+                "percentile": None,
+                "zscore": None,
+                "asof_date": asof_date,
+                "exp_date": exp_date,
+                "dte": dte,
+                "atm_strike": atm_strike,
+            }
+        
+        # Extract IV values from history
+        iv_series = []
+        for row in history_res.data:
+            iv_val = _safe_float(row.get("iv"))
+            if iv_val is not None and iv_val > 0:
+                iv_series.append(iv_val)
+        
+        if len(iv_series) < 20:
+            return {
+                "current": iv_current,
+                "rank": None,
+                "percentile": None,
+                "zscore": None,
+                "asof_date": asof_date,
+                "exp_date": exp_date,
+                "dte": dte,
+                "atm_strike": atm_strike,
+            }
+        
+        # Compute statistics
+        iv_min = min(iv_series)
+        iv_max = max(iv_series)
+        iv_mean = statistics.mean(iv_series)
+        iv_std = statistics.stdev(iv_series) if len(iv_series) > 1 else 0.0
+        
+        # IV Rank: (current - min) / (max - min) * 100
+        iv_rank = None
+        if iv_max > iv_min:
+            iv_rank = ((iv_current - iv_min) / (iv_max - iv_min)) * 100.0
+            iv_rank = max(0.0, min(100.0, iv_rank))  # Clamp to [0, 100]
+        
+        # IV Percentile: percentile rank of current within series
+        iv_percentile = None
+        if len(iv_series) > 0:
+            below_count = sum(1 for v in iv_series if v < iv_current)
+            iv_percentile = (below_count / len(iv_series)) * 100.0
+        
+        # IV Z-Score: (current - mean) / std
+        iv_zscore = None
+        if iv_std > 0:
+            iv_zscore = (iv_current - iv_mean) / iv_std
+        
+        return {
+            "current": iv_current,
+            "rank": iv_rank,
+            "percentile": iv_percentile,
+            "zscore": iv_zscore,
+            "asof_date": asof_date,
+            "exp_date": exp_date,
+            "dte": dte,
+            "atm_strike": atm_strike,
+        }
+        
+    except Exception as e:
+        logger.debug(f"Error fetching IV from snapshots for {ticker}: {e}")
+        return None
+
+
+def score_volatility_regime(iv_data: Optional[Dict[str, Any]]) -> float:
+    """
+    Compute volatility regime bonus for scoring.
+    
+    Returns:
+        Bonus points (0-15 total):
+        - IV Rank bonus: 0-10 points (higher rank => higher bonus)
+        - Mean reversion bonus: 0-5 points (if zscore > 1, add small bonus)
+    """
+    if iv_data is None:
+        return 0.0
+    
+    bonus = 0.0
+    
+    # IV Rank bonus: 0-10 points
+    iv_rank = iv_data.get("rank")
+    if iv_rank is not None:
+        # Scale: rank 0% = 0 points, rank 100% = 10 points
+        bonus += (iv_rank / 100.0) * 10.0
+    
+    # Mean reversion bonus: 0-5 points (if zscore > 1)
+    iv_zscore = iv_data.get("zscore")
+    if iv_zscore is not None and iv_zscore > 1.0:
+        # Scale: zscore 1.0 = 0 points, zscore 3.0+ = 5 points
+        z_bonus = min(5.0, (iv_zscore - 1.0) / 2.0 * 5.0)
+        bonus += z_bonus
+    
+    return bonus
 
 
 def score_fundamentals(
@@ -747,6 +899,7 @@ def main() -> None:
         MIN_MARKET_CAP = int(os.getenv("MIN_MARKET_CAP", "2000000000"))  # $2B default
         MIN_AVG_VOLUME = int(os.getenv("MIN_AVG_VOLUME", "1000000")) if os.getenv("MIN_AVG_VOLUME") else None
         RSI_MAX_AGE_HOURS = int(os.getenv("RSI_MAX_AGE_HOURS", "24"))
+        IV_LOOKBACK_DAYS = int(os.getenv("WHEEL_IV_LOOKBACK_DAYS", "252"))
         
         # Build universe
         if universe_source == "csv":
@@ -806,6 +959,11 @@ def main() -> None:
         growth_http_error = 0
         growth_blocked_402 = 0
         growth_parse_error = 0
+        # IV statistics
+        iv_missing = 0
+        iv_rank_available = 0
+        iv_percentile_available = 0
+        iv_zscore_available = 0
 
         for item in universe:
             t = item.get("symbol")
@@ -880,6 +1038,19 @@ def main() -> None:
                 
                 rsi = rsi_value
                 
+                # Fetch IV data from snapshots
+                iv_data = get_iv_from_snapshots(t, lookback_days=IV_LOOKBACK_DAYS)
+                if iv_data is None or iv_data.get("current") is None:
+                    iv_missing += 1
+                else:
+                    # Track IV metrics availability
+                    if iv_data.get("rank") is not None:
+                        iv_rank_available += 1
+                    if iv_data.get("percentile") is not None:
+                        iv_percentile_available += 1
+                    if iv_data.get("zscore") is not None:
+                        iv_zscore_available += 1
+                
                 # Track missing data
                 if not profile:
                     prof_missing += 1
@@ -914,6 +1085,9 @@ def main() -> None:
                     rsi_missing += 1
                     # Continue processing (RSI missing is OK, treated as neutral in scoring)
                 
+                # IV is NOT a hard filter - track missing but don't exclude
+                # Continue processing (IV missing is OK, no bonus applied)
+                
                 # Earnings exclusion is NOT applied here (happens in pick builders)
                 # We just track and store the data
                 
@@ -929,14 +1103,19 @@ def main() -> None:
                 trend_score, t_feats = score_trend_proxy(quote)
                 tech_score = score_technical(rsi_value)  # RSI contributes as soft score (10% weight)
                 
+                # Compute volatility regime bonus from IV
+                iv_bonus = score_volatility_regime(iv_data)
+                
                 # Composite wheel score (weighted) - same top-level weights
-                wheel_score = clamp_int(
+                # Add IV bonus as part of trend/technical component (small modifier)
+                base_score = (
                     0.50 * f_score +      # Fundamentals: 50%
                     0.20 * sent_score +   # Sentiment: 20%
                     0.20 * trend_score +  # Trend: 20%
-                    0.10 * tech_score,    # Technical (RSI): 10% - soft score, missing RSI = neutral
-                    0, 100
+                    0.10 * tech_score     # Technical (RSI): 10% - soft score, missing RSI = neutral
                 )
+                # Add IV bonus (0-15 points, scaled to 0-1.5% of total score)
+                wheel_score = clamp_int(base_score + (iv_bonus / 100.0) * 1.5, 0, 100)
                 
                 # Extract company info
                 name = profile.get("companyName") or profile.get("name") or item.get("name") or t
@@ -950,11 +1129,14 @@ def main() -> None:
                     "rsi_period": rules.rsi_period,
                     "rsi_interval": rules.rsi_interval,
                     "rsi_missing": rsi is None,
-                    "notes": "IV sourced from Schwab in pick builder; weekly_screener does not require IV to run"
+                    "iv_missing": iv_data is None or iv_data.get("current") is None,
+                    "iv_lookback_days": IV_LOOKBACK_DAYS,
+                    "notes": "IV sourced from Schwab option chain snapshots; weekly_screener does not require IV to run"
                 }
                 
                 # Build features dict with raw data (store all datasets in metrics)
                 # Store RSI as {"value": float|None, "period": int, "interval": str}
+                # Store IV as {"current": float|None, "rank": float|None, "percentile": float|None, "zscore": float|None, ...}
                 features = {
                     "profile": profile,
                     "quote": quote,
@@ -967,6 +1149,16 @@ def main() -> None:
                         "period": rules.rsi_period,
                         "interval": rules.rsi_interval,
                     },
+                    "iv": iv_data if iv_data else {
+                        "current": None,
+                        "rank": None,
+                        "percentile": None,
+                        "zscore": None,
+                        "asof_date": None,
+                        "exp_date": None,
+                        "dte": None,
+                        "atm_strike": None,
+                    },
                     "next_earnings_date": next_earnings_date.isoformat() if next_earnings_date else None,
                     "earnings_in_days": earnings_in_days,
                     "earnings_source": earnings_source,
@@ -974,6 +1166,7 @@ def main() -> None:
                     "sentiment_raw": sent,
                     "fundamentals_breakdown": f_breakdown,  # Store breakdown in features
                     "trend": t_feats,
+                    "iv_bonus": iv_bonus,  # Store IV bonus for transparency
                 }
                 
                 candidates.append(Candidate(
@@ -1036,6 +1229,13 @@ def main() -> None:
             f"(empty={rsi_empty}, http_error={rsi_http_error}, blocked_402={rsi_blocked_402}, parse_error={rsi_parse_error})"
         )
         
+        # Log IV coverage statistics
+        logger.info(
+            f"IV coverage: iv_missing={iv_missing}, iv_rank_available={iv_rank_available}, "
+            f"iv_percentile_available={iv_percentile_available}, iv_zscore_available={iv_zscore_available}, "
+            f"lookback_days={IV_LOOKBACK_DAYS}"
+        )
+        
         # Log fundamentals score distribution
         if fundamentals_scores:
             fundamentals_scores_sorted = sorted(fundamentals_scores)
@@ -1062,6 +1262,7 @@ def main() -> None:
         for i, c in enumerate(candidates, start=1):
             # Extract fundamentals breakdown from features
             fundamentals_breakdown = c.features.get("fundamentals_breakdown", {})
+            iv_data = c.features.get("iv", {})
             
             metrics_json = {
                 "wheel_score": c.wheel_score,
@@ -1084,7 +1285,9 @@ def main() -> None:
                 "financial_scores": c.features.get("financial_scores"),
                 "financial_growth": c.features.get("financial_growth"),
                 "rsi": c.features.get("rsi"),  # Stored as {"value": float|None, "period": int, "interval": str}
+                "iv": iv_data,  # Stored as {"current": float|None, "rank": float|None, "percentile": float|None, "zscore": float|None, ...}
                 "sentiment": c.features.get("sentiment_raw"),
+                "iv_bonus": c.features.get("iv_bonus", 0.0),
             }
             
             # Build row - try explicit columns first, fallback to metadata JSON
@@ -1097,8 +1300,8 @@ def main() -> None:
                 "market_cap": c.market_cap,
                 "sector": c.sector,
                 "industry": c.industry,
-                "iv": None,  # IV sourced from Schwab in pick builder
-                "iv_rank": None,  # IV rank computed from Schwab + history
+                "iv": iv_data.get("current") if iv_data else None,  # Store current IV in explicit column if available
+                "iv_rank": iv_data.get("rank") if iv_data else None,  # Store IV rank in explicit column if available
                 "beta": c.beta,
                 "rsi": c.rsi,
                 "sentiment_score": c.sentiment_score,
@@ -1142,13 +1345,14 @@ def main() -> None:
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "candidates_count": candidates_count,
             "picks_count": 0,
-            "notes": f"OK: candidates written (source={universe_source}, earnings_known={earnings_known}, earnings_unknown={earnings_unknown})"
+            "notes": f"OK: candidates written (source={universe_source}, earnings_known={earnings_known}, earnings_unknown={earnings_unknown}, iv_missing={iv_missing})"
         })
         
         logger.info(
             f"Run complete. run_id={run_id} | status=success | "
             f"candidates={candidates_count} | picks=0 | "
-            f"earnings_known={earnings_known} earnings_unknown={earnings_unknown}"
+            f"earnings_known={earnings_known} earnings_unknown={earnings_unknown} | "
+            f"iv_missing={iv_missing} iv_rank_available={iv_rank_available}"
         )
         
     except Exception as e:
