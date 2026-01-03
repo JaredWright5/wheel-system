@@ -357,6 +357,62 @@ def _determine_skip_reason(diag_counts: Dict[str, int], rules) -> str:
         return "other"
 
 
+def _find_best_in_delta_contract(puts: List[Dict[str, Any]], target_delta_low: float, target_delta_high: float, expiration: date, rules) -> Optional[Dict[str, Any]]:
+    """
+    Find the contract in delta band with the tightest spread, even if it fails liquidity checks.
+    Used for diagnostic logging when spread checks fail.
+    
+    Returns:
+        Contract dict with spread info, or None if no contracts in delta band
+    """
+    today = datetime.now(timezone.utc).date()
+    dte = (expiration - today).days
+    
+    best_in_delta: Optional[Dict[str, Any]] = None
+    best_spread_pct = float('inf')
+    
+    for o in puts:
+        # Check delta band
+        d = _safe_float(o.get("delta"))
+        if d is None:
+            continue
+        abs_delta = abs(d)
+        if not (target_delta_low <= abs_delta <= target_delta_high):
+            continue
+        
+        # Get bid/ask for spread calculation
+        bid = _safe_float(o.get("bid"), 0.0) or 0.0
+        ask = _safe_float(o.get("ask"), 0.0) or 0.0
+        if bid <= 0 or ask <= 0 or ask < bid:
+            continue
+        
+        mid = (bid + ask) / 2.0
+        if mid <= 0:
+            continue
+        
+        abs_spread = ask - bid
+        if abs_spread <= 0:
+            continue
+        
+        spread_pct = (abs_spread / mid) * 100.0 if mid > 0 else float('inf')
+        
+        # Track the contract with tightest spread
+        if spread_pct < best_spread_pct:
+            best_spread_pct = spread_pct
+            strike = _safe_float(o.get("strike"))
+            best_in_delta = {
+                "spread_pct": spread_pct,
+                "spread_abs": abs_spread,
+                "bid": bid,
+                "ask": ask,
+                "strike": strike,
+                "exp": expiration.isoformat(),
+                "delta": d,
+            }
+    
+    return best_in_delta
+
+
 def attempt_window(
     window_name: str,
     min_dte: int,
@@ -384,6 +440,7 @@ def attempt_window(
     Diagnostics dict includes:
         - puts_total, delta_present, in_delta, bid_ok, spread_ok, oi_ok
         - reason: skip reason string if no pick (or None if pick found)
+        - best_in_delta: dict with best in-delta contract info (if spread failed)
     """
     # Find expiration in window
     exp = find_expiration_in_window(expirations, min_dte=min_dte, max_dte=max_dte, now=now)
@@ -432,6 +489,11 @@ def attempt_window(
         diag_counts["reason"] = None
     else:
         diag_counts["reason"] = _determine_skip_reason(diag_counts, rules)
+        # If spread failed, track the best in-delta contract for logging
+        if "spread" in diag_counts.get("reason", "").lower():
+            best_in_delta = _find_best_in_delta_contract(puts, rules.csp_delta_min, rules.csp_delta_max, exp, rules)
+            if best_in_delta:
+                diag_counts["best_in_delta"] = best_in_delta
     
     return best, exp, diag_counts
 
@@ -763,6 +825,17 @@ def main() -> None:
                     log_msg += " (delta missing from Schwab)"
                 else:
                     log_msg += f" | reason={skip_reason}"
+                    # If spread failed, include best in-delta contract details
+                    if "spread" in skip_reason.lower() and "best_in_delta" in diag_to_log:
+                        best_in_delta = diag_to_log["best_in_delta"]
+                        log_msg += (
+                            f" | best_in_delta: exp={best_in_delta.get('exp')} "
+                            f"strike={best_in_delta.get('strike')} "
+                            f"delta={best_in_delta.get('delta', 0):.3f} "
+                            f"bid={best_in_delta.get('bid', 0):.2f} ask={best_in_delta.get('ask', 0):.2f} "
+                            f"spread_pct={best_in_delta.get('spread_pct', 0):.2f}% "
+                            f"spread_abs=${best_in_delta.get('spread_abs', 0):.2f}"
+                        )
                 
                 # If fallback was attempted, include fallback diagnostics
                 if fallback_attempted:
