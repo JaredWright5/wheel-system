@@ -1270,6 +1270,10 @@ def main() -> None:
         if len(selected_indices) >= WHEEL_CSP_MAX_TRADES:
             break
         
+        # Get required_cash from stored metadata
+        pick_metadata = pick_rows[idx].get("pick_metrics", {}).get("metadata", {})
+        required_cash = pick_metadata.get("required_cash", 0.0)
+        
         # Check if this pick fits within remaining allocatable cash
         if running_allocated_net + required_cash_net <= allocatable_cash:
             selected_indices.add(idx)
@@ -1281,7 +1285,7 @@ def main() -> None:
                 "cash_budget": portfolio_budget_cash,
                 "cash_buffer_pct": cash_buffer_pct,
                 "allocatable_cash": allocatable_cash,
-                "required_cash": pick_rows[idx]["pick_metrics"]["metadata"].get("required_cash", 0.0),
+                "required_cash": required_cash,
                 "required_cash_net": required_cash_net,
                 "selected": True,
                 "selection_rank": selection_rank,
@@ -1294,7 +1298,7 @@ def main() -> None:
                 "cash_budget": portfolio_budget_cash,
                 "cash_buffer_pct": cash_buffer_pct,
                 "allocatable_cash": allocatable_cash,
-                "required_cash": pick_rows[idx]["pick_metrics"]["metadata"].get("required_cash", 0.0),
+                "required_cash": required_cash,
                 "required_cash_net": required_cash_net,
                 "selected": False,
                 "selection_rank": None,
