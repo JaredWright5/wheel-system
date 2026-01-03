@@ -128,9 +128,9 @@ def _check_liquidity(option: Dict[str, Any], rules) -> Tuple[bool, Optional[str]
     bid = _safe_float(option.get("bid"), 0.0) or 0.0
     ask = _safe_float(option.get("ask"), 0.0) or 0.0
     
-    # Require bid >= MIN_BID
-    if bid < rules.min_bid:
-        return False, f"bid_below_min_{bid:.2f}"
+    # Require bid >= MIN_CREDIT (stricter than MIN_BID, so this is the effective check)
+    if bid < rules.min_credit:
+        return False, f"bid_below_min_credit_{bid:.2f}"
     
     # Require non-null ask
     if ask <= 0:
@@ -197,9 +197,9 @@ def _count_put_contracts_diagnostics(
             if target_delta_low <= abs_delta <= target_delta_high:
                 counts["in_delta"] += 1
         
-        # Count bid >= MIN_BID
+        # Count bid >= MIN_CREDIT (stricter than MIN_BID)
         bid = _safe_float(o.get("bid"), 0.0) or 0.0
-        if bid >= rules.min_bid:
+        if bid >= rules.min_credit:
             counts["bid_ok"] += 1
             
             # Count spread OK (only if bid >= MIN_BID)
@@ -347,7 +347,7 @@ def _determine_skip_reason(diag_counts: Dict[str, int], rules) -> str:
     elif diag_counts["in_delta"] == 0:
         return "delta out of band"
     elif diag_counts["bid_ok"] == 0:
-        return f"bid < ${rules.min_bid:.2f}"
+        return f"bid < ${rules.min_credit:.2f}"
     elif diag_counts["spread_ok"] == 0:
         return "spread failed (pct or abs)"
     elif diag_counts["oi_ok"] == 0:
@@ -448,7 +448,7 @@ def main() -> None:
         f"(allow_fallback={rules.allow_fallback_dte}), "
         f"earnings_avoid_days={rules.earnings_avoid_days}, "
         f"liquidity: max_spread_pct={rules.max_spread_pct}%, "
-        f"min_bid=${rules.min_bid:.2f}, min_oi={rules.min_open_interest}, "
+        f"min_bid=${rules.min_bid:.2f}, min_credit=${rules.min_credit:.2f}, min_oi={rules.min_open_interest}, "
         f"max_abs_spread_low=${rules.max_abs_spread_low_premium:.2f}, "
         f"max_abs_spread_high=${rules.max_abs_spread_high_premium:.2f}"
     )
@@ -521,6 +521,7 @@ def main() -> None:
     skipped_delta_missing = 0
     skipped_delta_out_of_band = 0
     skipped_bid_zero = 0
+    skipped_credit_too_low = 0
     skipped_spread = 0
     skipped_open_interest = 0
     
@@ -684,8 +685,8 @@ def main() -> None:
                     skipped_delta_missing += 1
                 elif skip_reason == "delta out of band":
                     skipped_delta_out_of_band += 1
-                elif "bid <" in skip_reason:
-                    skipped_bid_zero += 1
+                elif "bid <" in skip_reason or "bid_below_min_credit" in skip_reason:
+                    skipped_credit_too_low += 1
                 elif "spread" in skip_reason:
                     skipped_spread += 1
                 elif "oi <" in skip_reason:
@@ -742,6 +743,7 @@ def main() -> None:
 
             # Check liquidity pass status for metadata
             min_bid_ok = bid >= rules.min_bid
+            min_credit_ok = bid >= rules.min_credit
             spread_ok_status = False
             if min_bid_ok and ask > 0:
                 spread_ok_status = spread_ok(
@@ -852,6 +854,7 @@ def main() -> None:
         f"skipped_delta_missing={skipped_delta_missing}, "
         f"skipped_delta_out_of_band={skipped_delta_out_of_band}, "
         f"skipped_bid_zero={skipped_bid_zero}, "
+        f"skipped_credit_too_low={skipped_credit_too_low}, "
         f"skipped_spread={skipped_spread}, "
         f"skipped_open_interest={skipped_open_interest}"
     )
