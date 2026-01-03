@@ -14,17 +14,13 @@ This document describes the deployment configuration, cron schedules, and infras
 
 
 
-
-
 ## Overview
 
 The Wheel System is deployed on **Render.com** using:
 - **1 Web Service**: Dashboard (FastAPI)
-- **6 Cron Jobs**: Scheduled background workers
+- **7 Cron Jobs**: Scheduled background workers
 
 Configuration is defined in `render.yaml` at the repository root.
-
-
 
 
 
@@ -64,8 +60,6 @@ Configuration is defined in `render.yaml` at the repository root.
 
 
 
-
-
 ## Web Service
 
 ### wheel-dashboard
@@ -80,8 +74,6 @@ Configuration is defined in `render.yaml` at the repository root.
 - `PYTHONUNBUFFERED=1` - Ensures logs appear immediately
 - `SUPABASE_URL` - Database connection (set in Render dashboard)
 - `SUPABASE_SERVICE_ROLE_KEY` - Database auth (set in Render dashboard)
-
-
 
 
 
@@ -139,13 +131,19 @@ All cron jobs run on **Python runtime** with the same build process.
 - **Note**: Runs before weekly screener to populate cache
 
 ### 6. wheel-build-cc-picks
-- **Schedule**: Not yet in `render.yaml` (needs to be added)
+- **Schedule**: `"0 22 * * 1-5"` - Weekdays at 22:00 UTC (2:00 PM PT / 3:00 PM PDT)
 - **Start Command**: `PYTHONPATH=/opt/render/project/src python -m apps.worker.src.build_cc_picks`
 - **Purpose**: Generate Covered Call picks
 - **Dependencies**: Schwab Trader API (positions), Schwab Market Data API
 - **Duration**: ~2-5 minutes (depends on number of positions)
 
-
+### 7. wheel-iv-snapshot
+- **Schedule**: `"0 15 * * 1-5"` - Weekdays 7:00 AM PT (15:00 UTC during PST)
+- **Start Command**: `PYTHONPATH=/opt/render/project/src python -m apps.worker.src.iv_snapshot`
+- **Purpose**: Daily ATM IV snapshot collection for IV Rank/percentile computations
+- **Dependencies**: Schwab Market Data API, Supabase
+- **Duration**: ~2-10 minutes (depending on universe size)
+- **DST Note**: Schedule will need manual update during DST (15:00 UTC = 7:00 AM PT during PST, but 8:00 AM PT during PDT)
 
 
 
@@ -178,14 +176,15 @@ All cron jobs run on **Python runtime** with the same build process.
 - `RSI_PERIOD` - RSI period (default: 14)
 - `RSI_INTERVAL` - RSI interval (default: "daily")
 - `RSI_MAX_AGE_HOURS` - Max age for cached RSI (default: 24)
+- `WHEEL_IV_LOOKBACK_DAYS` - IV historical lookback period (default: 252)
+- `WHEEL_IV_ATM_METHOD` - IV ATM selection method (default: "nearest_put")
+- `WHEEL_IV_SNAPSHOT_MAX_SYMBOLS` - Optional cap for testing IV snapshot
 - `MIN_PRICE` - Minimum stock price filter (default: 5.0)
 - `MIN_MARKET_CAP` - Minimum market cap filter (default: 2000000000)
 - `MIN_DTE`, `MAX_DTE` - Option expiration windows
 - `PICKS_N` - Number of CSP picks to generate (default: 25)
 - `CC_PICKS_N` - Number of CC picks to generate (default: 25)
 - `CC_TEST_TICKERS` - Test mode for CC picks (comma-separated tickers)
-
-
 
 
 
@@ -222,8 +221,6 @@ All cron jobs run on **Python runtime** with the same build process.
 
 
 
-
-
 ## Cron Schedule Details
 
 ### Timezone Handling
@@ -248,8 +245,7 @@ Consider staggering Monday jobs:
 - `wheel-weekly-screener`: `"30 12 * * 1"` (Mon 4:30 AM PT) ✅
 - `wheel-build-csp-picks`: `"45 12 * * 1"` (Mon 4:45 AM PT) - Give screener 15 min
 - `wheel-build-cc-picks`: `"45 12 * * 1"` (Mon 4:45 AM PT) - Can run parallel with CSP
-
-
+- `wheel-iv-snapshot`: `"0 15 * * 1-5"` (Weekdays 7:00 AM PT) ✅
 
 
 
@@ -281,8 +277,6 @@ Consider staggering Monday jobs:
 - **Values**: 'running', 'success', 'failed'
 - **Error Field**: Stores error message if failed
 - **Query**: Can query `screening_runs` table to see run history
-
-
 
 
 
@@ -331,8 +325,6 @@ Consider staggering Monday jobs:
 
 
 
-
-
 ## Rollback Strategy
 
 ### Code Rollback
@@ -344,8 +336,6 @@ Consider staggering Monday jobs:
 - **Migrations**: Supabase tracks applied migrations
 - **Manual**: Can revert migration by creating new migration
 - **Data**: No automatic data rollback (manual restore if needed)
-
-
 
 
 
@@ -375,8 +365,6 @@ Consider staggering Monday jobs:
 
 
 
-
-
 ## Related Files
 
 - `render.yaml` - Deployment configuration
@@ -385,4 +373,3 @@ Consider staggering Monday jobs:
 - `apps/dashboard/app.py` - Dashboard application
 - `apps/worker/src/*.py` - Worker scripts
 - `Documentation/issues.md` - Known deployment issues
-

@@ -68,3 +68,13 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
+
+  - type: cron
+    name: wheel-iv-snapshot
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: PYTHONPATH=/opt/render/project/src python -m apps.worker.src.iv_snapshot
+    schedule: "0 15 * * 1-5"  # Weekdays 7:00 AM PT (15:00 UTC during PST)
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
