@@ -602,6 +602,9 @@ def main() -> None:
             fallback_attempted = False
             best = best_primary
             exp = exp_primary
+            selection_reason = None
+            primary_comparison_data = None
+            fallback_comparison_data = None
             
             # If primary succeeded and fallback is allowed, also try fallback to compare
             if best_primary and rules.allow_fallback_dte:
@@ -621,23 +624,54 @@ def main() -> None:
                 
                 if best_fallback:
                     # Both windows succeeded - compare using total_score
-                    # Calculate total_score for primary
+                    # Extract primary comparison data
+                    strike_primary = _safe_float(best_primary.get("strike"))
+                    delta_primary = _safe_float(best_primary.get("delta"))
+                    bid_primary = _safe_float(best_primary.get("bid"), 0.0) or 0.0
                     spread_pct_primary = _safe_float(best_primary.get("_spread_pct"), 0.0) or 0.0
+                    oi_primary = _safe_float(best_primary.get("openInterest"), 0.0) or 0.0
                     liquidity_bonus_primary = max(0.0, (0.05 - spread_pct_primary) * 100.0)
                     contract_score_primary = _safe_float(best_primary.get("_contract_score"), 0.0) or 0.0
                     total_score_primary = contract_score_primary + liquidity_bonus_primary
                     
-                    # Calculate total_score for fallback
+                    # Extract fallback comparison data
+                    strike_fallback = _safe_float(best_fallback.get("strike"))
+                    delta_fallback = _safe_float(best_fallback.get("delta"))
+                    bid_fallback = _safe_float(best_fallback.get("bid"), 0.0) or 0.0
                     spread_pct_fallback = _safe_float(best_fallback.get("_spread_pct"), 0.0) or 0.0
+                    oi_fallback = _safe_float(best_fallback.get("openInterest"), 0.0) or 0.0
                     liquidity_bonus_fallback = max(0.0, (0.05 - spread_pct_fallback) * 100.0)
                     contract_score_fallback = _safe_float(best_fallback.get("_contract_score"), 0.0) or 0.0
                     total_score_fallback = contract_score_fallback + liquidity_bonus_fallback
+                    
+                    # Store comparison data
+                    primary_comparison_data = {
+                        "contract_score": contract_score_primary,
+                        "total_score": total_score_primary,
+                        "exp": exp_primary.isoformat(),
+                        "strike": strike_primary,
+                        "delta": delta_primary,
+                        "bid": bid_primary,
+                        "spread_pct": spread_pct_primary,
+                        "oi": oi_primary,
+                    }
+                    fallback_comparison_data = {
+                        "contract_score": contract_score_fallback,
+                        "total_score": total_score_fallback,
+                        "exp": exp_fallback.isoformat(),
+                        "strike": strike_fallback,
+                        "delta": delta_fallback,
+                        "bid": bid_fallback,
+                        "spread_pct": spread_pct_fallback,
+                        "oi": oi_fallback,
+                    }
                     
                     # Choose the one with higher total_score
                     if total_score_fallback > total_score_primary:
                         best = best_fallback
                         exp = exp_fallback
                         window_used = "fallback"
+                        selection_reason = "fallback_better_score"
                         logger.info(
                             f"{ticker}: fallback selected | "
                             f"primary_score={total_score_primary:.4f} (contract={contract_score_primary:.4f} + bonus={liquidity_bonus_primary:.4f}) | "
@@ -645,6 +679,7 @@ def main() -> None:
                         )
                     else:
                         window_used = "primary"
+                        selection_reason = "primary_better_score"
                         logger.info(
                             f"{ticker}: primary selected | "
                             f"primary_score={total_score_primary:.4f} (contract={contract_score_primary:.4f} + bonus={liquidity_bonus_primary:.4f}) | "
@@ -653,9 +688,11 @@ def main() -> None:
                 else:
                     # Primary succeeded, fallback failed - use primary
                     window_used = "primary"
+                    selection_reason = "primary_only"
             elif best_primary:
                 # Primary succeeded, fallback not allowed or not attempted
                 window_used = "primary"
+                selection_reason = "primary_only"
             else:
                 # Primary failed - check if we should try fallback
                 should_try_fallback = (
@@ -684,6 +721,7 @@ def main() -> None:
                         best = best_fallback
                         exp = exp_fallback
                         window_used = "fallback"
+                        selection_reason = "fallback_only"
                     else:
                         # Fallback also failed - will use primary diagnostics for logging
                         pass
@@ -808,7 +846,20 @@ def main() -> None:
                     "oi_ok": oi_ok,
                 },
                 "used_dte_window": window_used,
+                "chosen_contract_score": contract_score,
+                "chosen_total_score": total_score,
+                "chosen_liquidity_bonus": liquidity_bonus,
             }
+            
+            # Add comparison data if available
+            if primary_comparison_data is not None or fallback_comparison_data is not None:
+                metadata["window_comparison"] = {}
+                if primary_comparison_data is not None:
+                    metadata["window_comparison"]["primary"] = primary_comparison_data
+                if fallback_comparison_data is not None:
+                    metadata["window_comparison"]["fallback"] = fallback_comparison_data
+                if selection_reason:
+                    metadata["window_comparison"]["selection_reason"] = selection_reason
 
             pick_rows.append({
                 "run_id": run_id,
