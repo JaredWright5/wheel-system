@@ -119,47 +119,88 @@ def _safe_float(x, default=None):
 
 def _fetch_portfolio_budget_from_schwab() -> Tuple[float, str]:
     """
-    Fetch portfolio cash budget from Schwab account balances.
+    Fetch portfolio cash budget from Schwab account balances with robust schema handling.
+    
+    Handles nested structures (securitiesAccount.currentBalances, etc.) and tries multiple
+    balance buckets and cash field names in priority order.
     
     Returns:
         (cash_amount, source_string)
-        source_string indicates which field was used (e.g., "schwab:optionBuyingPower")
+        source_string format: "schwab:{balance_bucket}.{key}" or "fallback:reason"
     """
     try:
         schwab = SchwabClient.from_env()
-        acct = schwab.get_account()
+        response = schwab.get_account()
         
-        if not isinstance(acct, dict):
+        if not isinstance(response, dict):
             logger.warning("Schwab account response is not a dict, using fallback budget")
             return DEFAULT_PORTFOLIO_CASH, "fallback:invalid_response"
         
-        # Extract balances from common locations
-        balances = None
-        for key in ["securitiesAccount", "account"]:
-            if isinstance(acct.get(key), dict):
-                balances = acct[key].get("currentBalances") or acct[key].get("balances") or {}
-                if balances:
-                    break
+        # Normalize response into "account" dict
+        account = None
+        if isinstance(response.get("securitiesAccount"), dict):
+            account = response["securitiesAccount"]
+        elif isinstance(response.get("account"), dict):
+            account = response["account"]
+        else:
+            # Use raw response as account
+            account = response
         
-        if not balances:
-            logger.warning("Schwab account response missing balances, using fallback budget")
-            return DEFAULT_PORTFOLIO_CASH, "fallback:no_balances"
+        if not isinstance(account, dict):
+            logger.warning("Schwab account response missing account dict, using fallback budget")
+            return DEFAULT_PORTFOLIO_CASH, "fallback:no_account"
         
-        # Try cash fields in priority order
-        cash_fields = [
-            ("optionBuyingPower", "schwab:optionBuyingPower"),
-            ("availableFundsForTrading", "schwab:availableFundsForTrading"),
-            ("cashAvailableForTrading", "schwab:cashAvailableForTrading"),
-            ("totalCash", "schwab:totalCash"),
+        # Gather candidate balance dicts in priority order
+        balance_buckets = [
+            ("currentBalances", account.get("currentBalances")),
+            ("projectedBalances", account.get("projectedBalances")),
+            ("initialBalances", account.get("initialBalances")),
         ]
         
-        for field_name, source in cash_fields:
-            cash_value = _safe_float(balances.get(field_name))
-            if cash_value is not None and cash_value > 0:
-                logger.info(f"Portfolio budget from Schwab: {source} = ${cash_value:,.2f}")
-                return cash_value, source
+        # Cash/buying power field names in priority order
+        cash_field_names = [
+            "optionBuyingPower",
+            "availableFundsForTrading",
+            "cashAvailableForTrading",
+            "buyingPower",
+            "availableFunds",
+            "cashBalance",
+            "totalCash",
+            "moneyMarketFund",
+        ]
         
-        logger.warning("Schwab balances missing all cash fields, using fallback budget")
+        # Try each balance bucket
+        for balance_bucket_name, balance_dict in balance_buckets:
+            if not isinstance(balance_dict, dict):
+                continue
+            
+            # Try each cash field name in priority order
+            for field_name in cash_field_names:
+                cash_value = _safe_float(balance_dict.get(field_name))
+                if cash_value is not None and cash_value > 0:
+                    source = f"schwab:{balance_bucket_name}.{field_name}"
+                    logger.info(f"Portfolio budget from Schwab: {source} = ${cash_value:,.2f}")
+                    return cash_value, source
+        
+        # No cash value found - log structural info for debugging (no sensitive values)
+        top_level_keys = list(response.keys()) if isinstance(response, dict) else []
+        securities_account_keys = []
+        balance_keys_by_bucket = {}
+        
+        if isinstance(response.get("securitiesAccount"), dict):
+            securities_account_keys = list(response["securitiesAccount"].keys())
+        
+        for balance_bucket_name, balance_dict in balance_buckets:
+            if isinstance(balance_dict, dict):
+                balance_keys_by_bucket[balance_bucket_name] = list(balance_dict.keys())
+        
+        logger.warning(
+            f"Schwab account response missing all cash fields. "
+            f"Top-level keys: {top_level_keys}, "
+            f"securitiesAccount keys: {securities_account_keys}, "
+            f"balance keys: {balance_keys_by_bucket}. "
+            f"Using fallback budget."
+        )
         return DEFAULT_PORTFOLIO_CASH, "fallback:no_cash_fields"
         
     except Exception as e:
