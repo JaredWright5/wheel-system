@@ -2,6 +2,7 @@
 Build CSP (Cash-Secured Put) picks from screening candidates.
 Uses WheelRules for consistent configuration and applies earnings exclusion.
 Enhanced with diagnostic logging for pick generation failures.
+Includes dynamic portfolio budget fetching from Schwab and portfolio selection.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from loguru import logger
 
 from wheel.clients.supabase_client import get_supabase, upsert_rows
 from wheel.clients.schwab_marketdata_client import SchwabMarketDataClient
+from wheel.clients.schwab_client import SchwabClient
 from apps.worker.src.config.wheel_rules import (
     load_wheel_rules,
     find_expiration_in_window,
@@ -36,6 +38,11 @@ CSP_TARGET_PICKS = int(os.getenv("CSP_TARGET_PICKS", "10"))
 
 # Maximum annualized yield (as decimal, e.g., 3.0 = 300%)
 MAX_ANNUALIZED_YIELD = float(os.getenv("MAX_ANNUALIZED_YIELD", "3.0"))
+
+# Portfolio budget and selection parameters
+WHEEL_CSP_MAX_TRADES = int(os.getenv("WHEEL_CSP_MAX_TRADES", "4"))
+WHEEL_CSP_MIN_CASH_BUFFER_PCT = float(os.getenv("WHEEL_CSP_MIN_CASH_BUFFER_PCT", "0.10"))
+DEFAULT_PORTFOLIO_CASH = 50000.0  # Fallback if Schwab fetch fails
 
 
 # ---------- Helpers ----------
@@ -108,6 +115,84 @@ def _safe_float(x, default=None):
         return float(x)
     except Exception:
         return default
+
+
+def _fetch_portfolio_budget_from_schwab() -> Tuple[float, str]:
+    """
+    Fetch portfolio cash budget from Schwab account balances.
+    
+    Returns:
+        (cash_amount, source_string)
+        source_string indicates which field was used (e.g., "schwab:optionBuyingPower")
+    """
+    try:
+        schwab = SchwabClient.from_env()
+        acct = schwab.get_account()
+        
+        if not isinstance(acct, dict):
+            logger.warning("Schwab account response is not a dict, using fallback budget")
+            return DEFAULT_PORTFOLIO_CASH, "fallback:invalid_response"
+        
+        # Extract balances from common locations
+        balances = None
+        for key in ["securitiesAccount", "account"]:
+            if isinstance(acct.get(key), dict):
+                balances = acct[key].get("currentBalances") or acct[key].get("balances") or {}
+                if balances:
+                    break
+        
+        if not balances:
+            logger.warning("Schwab account response missing balances, using fallback budget")
+            return DEFAULT_PORTFOLIO_CASH, "fallback:no_balances"
+        
+        # Try cash fields in priority order
+        cash_fields = [
+            ("optionBuyingPower", "schwab:optionBuyingPower"),
+            ("availableFundsForTrading", "schwab:availableFundsForTrading"),
+            ("cashAvailableForTrading", "schwab:cashAvailableForTrading"),
+            ("totalCash", "schwab:totalCash"),
+        ]
+        
+        for field_name, source in cash_fields:
+            cash_value = _safe_float(balances.get(field_name))
+            if cash_value is not None and cash_value > 0:
+                logger.info(f"Portfolio budget from Schwab: {source} = ${cash_value:,.2f}")
+                return cash_value, source
+        
+        logger.warning("Schwab balances missing all cash fields, using fallback budget")
+        return DEFAULT_PORTFOLIO_CASH, "fallback:no_cash_fields"
+        
+    except Exception as e:
+        logger.warning(f"Failed to fetch portfolio budget from Schwab: {e}. Using fallback budget.")
+        return DEFAULT_PORTFOLIO_CASH, "fallback:exception"
+
+
+def _determine_portfolio_budget() -> Tuple[float, str]:
+    """
+    Determine portfolio cash budget from env var or Schwab.
+    
+    Priority:
+    1. WHEEL_CSP_PORTFOLIO_CASH env var (if set)
+    2. Schwab account balances
+    3. Default fallback
+    
+    Returns:
+        (cash_amount, source_string)
+    """
+    env_cash = os.getenv("WHEEL_CSP_PORTFOLIO_CASH", "").strip()
+    if env_cash:
+        try:
+            cash = float(env_cash)
+            if cash > 0:
+                logger.info(f"Portfolio budget from env: WHEEL_CSP_PORTFOLIO_CASH = ${cash:,.2f}")
+                return cash, "env"
+            else:
+                logger.warning(f"WHEEL_CSP_PORTFOLIO_CASH is non-positive ({cash}), fetching from Schwab")
+        except ValueError:
+            logger.warning(f"WHEEL_CSP_PORTFOLIO_CASH is not a valid float ({env_cash}), fetching from Schwab")
+    
+    # Fetch from Schwab
+    return _fetch_portfolio_budget_from_schwab()
 
 
 def _parse_expirations_from_chain(chain: Any) -> List[date]:
@@ -1151,6 +1236,79 @@ def main() -> None:
                     f"yield={ann_yld:.2%} | total_score={chosen_total_score:.4f}"
                 )
 
+    # Portfolio budget determination and selection
+    portfolio_budget_cash, budget_source = _determine_portfolio_budget()
+    cash_buffer_pct = WHEEL_CSP_MIN_CASH_BUFFER_PCT
+    allocatable_cash = portfolio_budget_cash * (1.0 - cash_buffer_pct)
+    
+    logger.info(
+        f"Portfolio budget: source={budget_source}, "
+        f"cash_budget=${portfolio_budget_cash:,.2f}, "
+        f"buffer_pct={cash_buffer_pct:.1%}, "
+        f"allocatable_cash=${allocatable_cash:,.2f}, "
+        f"max_trades={WHEEL_CSP_MAX_TRADES}"
+    )
+    
+    # Portfolio selection: select picks that fit within budget
+    # Sort picks by total_score (descending) to prioritize best picks
+    picks_with_scores = []
+    for idx, pick in enumerate(pick_rows):
+        metadata = pick.get("pick_metrics", {}).get("metadata", {})
+        total_score = metadata.get("total_score") or metadata.get("chosen_total_score") or 0.0
+        required_cash_net = metadata.get("required_cash_net", 0.0)
+        picks_with_scores.append((idx, total_score, required_cash_net))
+    
+    # Sort by total_score descending (best first)
+    picks_with_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    selected_indices = set()
+    running_allocated_net = 0.0
+    selection_rank = 0
+    
+    for idx, total_score, required_cash_net in picks_with_scores:
+        # Check if we've hit max trades limit
+        if len(selected_indices) >= WHEEL_CSP_MAX_TRADES:
+            break
+        
+        # Check if this pick fits within remaining allocatable cash
+        if running_allocated_net + required_cash_net <= allocatable_cash:
+            selected_indices.add(idx)
+            running_allocated_net += required_cash_net
+            selection_rank += 1
+            # Store selection rank in metadata
+            pick_rows[idx]["pick_metrics"]["metadata"]["portfolio"] = {
+                "budget_source": budget_source,
+                "cash_budget": portfolio_budget_cash,
+                "cash_buffer_pct": cash_buffer_pct,
+                "allocatable_cash": allocatable_cash,
+                "required_cash": pick_rows[idx]["pick_metrics"]["metadata"].get("required_cash", 0.0),
+                "required_cash_net": required_cash_net,
+                "selected": True,
+                "selection_rank": selection_rank,
+                "running_allocated_net": running_allocated_net,
+            }
+        else:
+            # Pick doesn't fit - mark as not selected
+            pick_rows[idx]["pick_metrics"]["metadata"]["portfolio"] = {
+                "budget_source": budget_source,
+                "cash_budget": portfolio_budget_cash,
+                "cash_buffer_pct": cash_buffer_pct,
+                "allocatable_cash": allocatable_cash,
+                "required_cash": pick_rows[idx]["pick_metrics"]["metadata"].get("required_cash", 0.0),
+                "required_cash_net": required_cash_net,
+                "selected": False,
+                "selection_rank": None,
+                "running_allocated_net": None,
+            }
+    
+    # Log portfolio selection summary
+    selected_count = len(selected_indices)
+    logger.info(
+        f"Portfolio selection: {selected_count}/{len(pick_rows)} picks selected, "
+        f"allocated=${running_allocated_net:,.2f} / ${allocatable_cash:,.2f} allocatable "
+        f"(${portfolio_budget_cash:,.2f} budget with {cash_buffer_pct:.1%} buffer)"
+    )
+
     # 3) Delete existing CSP picks for this run_id, then insert new ones
     # (This ensures idempotent reruns)
     logger.info(f"Deleting existing CSP picks for run_id={run_id}")
@@ -1170,7 +1328,7 @@ def main() -> None:
     if hasattr(insert_res, "error") and insert_res.error:
         raise RuntimeError(f"Supabase error inserting picks: {insert_res.error}")
     
-    logger.info(f"✅ build_csp_picks complete. Created {len(pick_rows)} CSP picks for run_id={run_id}")
+    logger.info(f"✅ build_csp_picks complete. Created {len(pick_rows)} CSP picks for run_id={run_id} ({selected_count} selected for portfolio)")
 
 
 if __name__ == "__main__":
