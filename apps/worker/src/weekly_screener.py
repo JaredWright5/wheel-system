@@ -187,6 +187,12 @@ def fetch_earnings_calendar_range(
         # Build canonical universe symbol set for matching
         universe_canon = {normalize_equity_symbol(s) for s in universe_symbols}
         
+        # Build reverse mapping: canonical -> original (for getting original symbol after matching)
+        canonical_to_original: Dict[str, str] = {}
+        for orig_sym in universe_symbols:
+            canon_sym = normalize_equity_symbol(orig_sym)
+            canonical_to_original[canon_sym] = orig_sym
+        
         # Parse earnings rows
         for item in earnings_cal:
             if not isinstance(item, dict):
@@ -240,12 +246,7 @@ def fetch_earnings_calendar_range(
             if event_sym not in universe_canon:
                 continue
             
-            # Find original universe symbol (build reverse mapping: canonical -> original)
-            canonical_to_original: Dict[str, str] = {}
-            for orig_sym in universe_symbols:
-                canon_sym = normalize_equity_symbol(orig_sym)
-                canonical_to_original[canon_sym] = orig_sym
-            
+            # Find original universe symbol using reverse mapping
             universe_symbol = canonical_to_original.get(event_sym)
             if not universe_symbol:
                 continue
