@@ -232,12 +232,12 @@ def _choose_best_put_in_delta_band(
     rules,
 ) -> Optional[Dict[str, Any]]:
     """
-    Choose the best PUT option in the target delta band that maximizes annualized yield.
+    Choose the best PUT option in the target delta band using contract_score.
     
     Requirements:
     - abs(delta) in [target_delta_low, target_delta_high]
-    - Passes liquidity checks (bid >= MIN_BID, spread_ok, OI >= MIN_OPEN_INTEREST)
-    - Maximizes annualized_yield = (premium / strike) * (365 / dte)
+    - Passes liquidity checks (bid >= MIN_CREDIT, spread_ok, OI >= MIN_OPEN_INTEREST)
+    - Maximizes contract_score
     """
     if not options:
         return None
@@ -737,7 +737,7 @@ def main() -> None:
                 logger.warning(log_msg)
                 continue
 
-            # Extract values
+            # Extract values from winning contract
             strike = _safe_float(best.get("strike"))
             premium = _safe_float(best.get("_premium"))
             abs_delta = _safe_float(best.get("_abs_delta"))
@@ -752,13 +752,22 @@ def main() -> None:
             contract_score = _safe_float(best.get("_contract_score"))
             oi = _safe_float(best.get("openInterest"), 0.0) or 0.0
 
-            # Calculate liquidity bonus and total_score
+            # Ensure contract_score exists (should always be present from _choose_best_put_in_delta_band)
+            if contract_score is None:
+                logger.warning(f"{ticker}: contract_score missing from best contract, calculating...")
+                contract_score = (
+                    ann_yld
+                    - (spread_pct * 10.0)
+                    - ((1.0 / math.sqrt(oi + 1.0)) * 5.0)
+                    + (abs_delta * 10.0)
+                )
+
+            # Calculate liquidity bonus and total_score (for comparison logging only)
             liquidity_bonus = max(0.0, (0.05 - spread_pct) * 100.0)
             total_score = contract_score + liquidity_bonus
 
             # Check liquidity pass status for metadata
             min_bid_ok = bid >= rules.min_bid
-            min_credit_ok = bid >= rules.min_credit
             spread_ok_status = False
             if min_bid_ok and ask > 0:
                 spread_ok_status = spread_ok(
@@ -770,19 +779,36 @@ def main() -> None:
                 )
             oi_ok = oi >= rules.min_open_interest
 
-            # Log successful pick with window used and scoring details
+            # Log successful pick with contract_score
             logger.info(
                 f"{ticker}: pick created | window={window_used} | "
                 f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
-                f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
-                f"contract_score={contract_score:.4f} | total_score={total_score:.4f} | "
-                f"spread_pct={spread_pct:.2f}% | oi={oi:.0f}"
+                f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | score={contract_score:.4f}"
             )
 
             # Get RSI period/interval from candidate metrics or use defaults
             candidate_metrics = c.get("metrics") or {}
             rsi_period = candidate_metrics.get("rsi_period") or rules.rsi_period
             rsi_interval = candidate_metrics.get("rsi_interval") or rules.rsi_interval
+
+            # Build metadata object as specified
+            metadata = {
+                "contract_score": contract_score,
+                "score_components": {
+                    "annualized_yield": ann_yld,
+                    "spread_pct": spread_pct,
+                    "spread_abs": spread_abs,
+                    "open_interest": oi,
+                    "delta_abs": abs_delta,
+                    "dte": dte,
+                },
+                "liquidity": {
+                    "min_bid_ok": min_bid_ok,
+                    "spread_ok": spread_ok_status,
+                    "oi_ok": oi_ok,
+                },
+                "used_dte_window": window_used,
+            }
 
             pick_rows.append({
                 "run_id": run_id,
@@ -806,6 +832,7 @@ def main() -> None:
                 "earn_in_days": earnings_in_days,  # Use the loaded value
                 "sentiment_score": c.get("sentiment_score"),
                 "pick_metrics": {
+                    "metadata": metadata,
                     "rule_context": {
                         "used_dte_window": window_used,
                         "earnings_avoid_days": rules.earnings_avoid_days,
@@ -836,19 +863,6 @@ def main() -> None:
                         "symbol": best.get("symbol"),
                         "abs_delta": abs_delta,
                         "dte": dte,
-                    },
-                    "score_components": {
-                        "annualized_yield": ann_yld,
-                        "spread_pct": spread_pct,
-                        "spread_abs": spread_abs,
-                        "open_interest": oi,
-                        "delta_abs": abs_delta,
-                        "dte": dte,
-                    },
-                    "liquidity_pass": {
-                        "min_bid": min_bid_ok,
-                        "spread_ok": spread_ok_status,
-                        "oi_ok": oi_ok,
                     },
                 },
             })
