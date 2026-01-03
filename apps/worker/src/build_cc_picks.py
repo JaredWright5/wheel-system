@@ -14,7 +14,6 @@ from loguru import logger
 from wheel.clients.supabase_client import get_supabase, upsert_rows
 from wheel.clients.schwab_client import SchwabClient
 from wheel.clients.schwab_marketdata_client import SchwabMarketDataClient
-from wheel.clients.fmp_stable_client import FMPStableClient
 from apps.worker.src.config.wheel_rules import (
     load_wheel_rules,
     find_expiration_in_window,
@@ -30,15 +29,11 @@ load_dotenv(".env.local")
 # Allow env override of run_id for reruns
 RUN_ID = os.getenv("RUN_ID")  # None = use latest
 
-# Number of positions to process (default 25)
-CC_PICKS_N = int(os.getenv("CC_PICKS_N", "25"))
-
 # Allow ITM calls (default False - prefer OTM)
 ALLOW_ITM_CALLS = os.getenv("ALLOW_ITM_CALLS", "false").lower() == "true"
 
-# Test mode: comma-separated tickers (e.g., "AAPL,MSFT")
-CC_TEST_TICKERS = os.getenv("CC_TEST_TICKERS", "").strip()
-CC_TEST_MODE = bool(CC_TEST_TICKERS)
+# Maximum annualized yield (as decimal, e.g., 3.0 = 300%)
+MAX_ANNUALIZED_YIELD = float(os.getenv("MAX_ANNUALIZED_YIELD", "3.0"))
 
 
 # ---------- Helpers ----------
@@ -251,6 +246,8 @@ def _choose_best_call_in_delta_band(
     - delta in [target_delta_low, target_delta_high] (calls have positive delta)
     - Passes liquidity checks (bid >= MIN_BID, spread_ok, OI >= MIN_OPEN_INTEREST)
     - Prefer OTM calls (strike >= current_price) unless allow_itm=True
+    - Quote sanity: ask >= bid, mid > 0, abs_spread > 0
+    - Yield sanity: annualized_yield <= MAX_ANNUALIZED_YIELD
     - Maximizes annualized_yield = (premium / strike) * (365 / dte)
     """
     if not options:
@@ -289,6 +286,16 @@ def _choose_best_call_in_delta_band(
         if mark is None or mark <= 0:
             continue
 
+        # Quote sanity checks
+        if ask < bid:
+            continue  # Invalid: ask < bid
+        mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else mark
+        if mid <= 0:
+            continue  # Invalid: mid must be > 0
+        abs_spread = ask - bid
+        if abs_spread <= 0:
+            continue  # Invalid: spread must be > 0
+
         strike = _safe_float(o.get("strike"))
         if strike is None or strike <= 0:
             continue
@@ -302,11 +309,21 @@ def _choose_best_call_in_delta_band(
         premium_yield = mark / strike
         annualized_yield = premium_yield * (365.0 / float(dte))
 
+        # Yield sanity check
+        if annualized_yield > MAX_ANNUALIZED_YIELD:
+            continue  # Reject contracts with unrealistic yields
+
+        # Calculate spread percentage
+        spread_pct = (abs_spread / mid) * 100.0 if mid > 0 else 0.0
+
         candidates.append({
             **o,
             "_delta": delta,
             "_premium": mark,
             "_annualized_yield": annualized_yield,
+            "_mid": mid,
+            "_spread_abs": abs_spread,
+            "_spread_pct": spread_pct,
             "_liquidity_ok": True,
         })
 
@@ -318,42 +335,116 @@ def _choose_best_call_in_delta_band(
     return candidates[0]
 
 
-def _pick_expiration_with_fallback(
-    expirations: List[date],
-    rules,
-    now: Optional[date] = None,
-) -> Tuple[Optional[date], Optional[str]]:
+def _determine_skip_reason(diag_counts: Dict[str, int], rules, allow_itm: bool) -> str:
     """
-    Pick expiration using primary window, with fallback if allowed.
+    Determine skip reason string from diagnostics.
     
     Returns:
-        (expiration_date, window_name) or (None, None) if no match
+        Reason string like "delta out of band", "spread failed", etc.
     """
-    if now is None:
-        now = datetime.now(timezone.utc).date()
+    if diag_counts["delta_present"] == 0:
+        return "delta missing from Schwab"
+    elif diag_counts["in_delta"] == 0:
+        return "delta out of band"
+    elif diag_counts["bid_ok"] == 0:
+        return f"bid < ${rules.min_bid:.2f}"
+    elif diag_counts["spread_ok"] == 0:
+        return "spread failed (pct or abs)"
+    elif diag_counts["oi_ok"] == 0:
+        return f"oi < {rules.min_open_interest}"
+    elif diag_counts["otm_ok"] == 0 and not allow_itm:
+        return "no OTM calls"
+    else:
+        return "other"
+
+
+def attempt_window(
+    window_name: str,
+    min_dte: int,
+    max_dte: int,
+    chain: Dict[str, Any],
+    expirations: List[date],
+    current_price: float,
+    rules,
+    allow_itm: bool,
+    now: date,
+) -> Tuple[Optional[Dict[str, Any]], Optional[date], Dict[str, Any]]:
+    """
+    Attempt to find a valid CALL contract in a given DTE window.
     
-    # Primary window: [DTE_MIN_PRIMARY, DTE_MAX_PRIMARY]
-    exp = find_expiration_in_window(
-        expirations,
-        min_dte=rules.dte_min_primary,
-        max_dte=rules.dte_max_primary,
-        now=now,
+    Args:
+        window_name: Name of window for logging (e.g., "primary", "fallback")
+        min_dte: Minimum DTE for the window
+        max_dte: Maximum DTE for the window
+        chain: Option chain from Schwab
+        expirations: List of available expiration dates
+        current_price: Current underlying price (for OTM check)
+        rules: WheelRules instance
+        allow_itm: Whether to allow ITM calls
+        now: Current date (UTC)
+        
+    Returns:
+        (best_contract or None, expiration_date or None, diagnostics_dict)
+        
+    Diagnostics dict includes:
+        - calls_total, delta_present, in_delta, bid_ok, spread_ok, oi_ok, otm_ok
+        - reason: skip reason string if no pick (or None if pick found)
+    """
+    # Find expiration in window
+    exp = find_expiration_in_window(expirations, min_dte=min_dte, max_dte=max_dte, now=now)
+    if not exp:
+        return None, None, {
+            "calls_total": 0,
+            "delta_present": 0,
+            "in_delta": 0,
+            "bid_ok": 0,
+            "spread_ok": 0,
+            "oi_ok": 0,
+            "otm_ok": 0,
+            "reason": "no expiration in window",
+        }
+    
+    # Extract CALL options for this expiration
+    calls = _extract_call_options_for_exp(chain, exp)
+    if not calls:
+        return None, None, {
+            "calls_total": 0,
+            "delta_present": 0,
+            "in_delta": 0,
+            "bid_ok": 0,
+            "spread_ok": 0,
+            "oi_ok": 0,
+            "otm_ok": 0,
+            "reason": "no CALLs extracted",
+        }
+    
+    # Count diagnostics BEFORE filtering
+    diag_counts = _count_call_contracts_diagnostics(
+        calls,
+        target_delta_low=rules.cc_delta_min,
+        target_delta_high=rules.cc_delta_max,
+        current_price=current_price,
+        rules=rules,
+        allow_itm=allow_itm,
     )
-    if exp:
-        return exp, "primary"
     
-    # Fallback window (if allowed)
-    if rules.allow_fallback_dte:
-        exp = find_expiration_in_window(
-            expirations,
-            min_dte=rules.dte_min_fallback,
-            max_dte=rules.dte_max_fallback,
-            now=now,
-        )
-        if exp:
-            return exp, "fallback"
+    # Try to find best CALL in delta band
+    best = _choose_best_call_in_delta_band(
+        calls,
+        target_delta_low=rules.cc_delta_min,
+        target_delta_high=rules.cc_delta_max,
+        current_price=current_price,
+        expiration=exp,
+        rules=rules,
+        allow_itm=allow_itm,
+    )
     
-    return None, None
+    if best:
+        diag_counts["reason"] = None
+    else:
+        diag_counts["reason"] = _determine_skip_reason(diag_counts, rules, allow_itm)
+    
+    return best, exp, diag_counts
 
 
 # ---------- Main ----------
@@ -361,7 +452,6 @@ def _pick_expiration_with_fallback(
 def main() -> None:
     # Load wheel rules
     rules = load_wheel_rules()
-    mode = "test" if CC_TEST_MODE else "positions"
     logger.info(
         f"Wheel rules in effect: "
         f"CC delta=[{rules.cc_delta_min:.2f}, {rules.cc_delta_max:.2f}], "
@@ -400,84 +490,64 @@ def main() -> None:
         run_id = runs[0]["run_id"]
         logger.info(f"Using latest successful screening run_id: {run_id} (run_ts={runs[0].get('run_ts')})")
 
-    # 2) Get eligible positions (test mode or real positions)
+    # 2) Get eligible Schwab positions (long equity only, qty > 0)
+    logger.info("Fetching Schwab account positions...")
+    schwab = SchwabClient.from_env()
+    acct = schwab.get_account(fields="positions")
+    
+    # Parse positions from account response
+    positions: List[Dict[str, Any]] = []
+    sec = acct.get("securitiesAccount") if isinstance(acct, dict) else acct
+    if isinstance(sec, dict):
+        positions = sec.get("positions") or []
+    
+    logger.info(f"Found {len(positions)} total positions")
+    
     eligible_positions: List[Dict[str, Any]] = []
     
-    if CC_TEST_MODE:
-        # Test mode: use CC_TEST_TICKERS as synthetic positions
-        test_tickers = [t.strip().upper() for t in CC_TEST_TICKERS.split(",") if t.strip()]
-        logger.info(f"TEST MODE: Using test tickers: {test_tickers}")
+    # Filter eligible positions (equities, long, quantity > 0)
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
         
-        for ticker in test_tickers:
-            eligible_positions.append({
-                "symbol": ticker,
-                "quantity": 100,  # Synthetic quantity
-                "current_price": None,  # Will be fetched from chain
-                "asset_type": "EQUITY",
-                "raw_position": None,
-            })
+        instr = pos.get("instrument") or {}
+        asset_type = instr.get("assetType")
+        symbol = instr.get("symbol") or instr.get("underlyingSymbol") or ""
         
-        logger.info(f"TEST MODE: Created {len(eligible_positions)} synthetic positions")
-    else:
-        # Normal mode: fetch Schwab positions
-        logger.info("Fetching Schwab account positions...")
-        schwab = SchwabClient.from_env()
-        acct = schwab.get_account(fields="positions")
+        # Only equities (ignore options)
+        if asset_type not in ("EQUITY", "STOCK"):
+            continue
         
-        # Parse positions from account response
-        positions: List[Dict[str, Any]] = []
-        sec = acct.get("securitiesAccount") if isinstance(acct, dict) else acct
-        if isinstance(sec, dict):
-            positions = sec.get("positions") or []
+        # Get quantity (long only, qty > 0)
+        quantity = _safe_float(pos.get("longQuantity") or pos.get("quantity"), 0.0) or 0.0
+        if quantity <= 0:
+            continue
         
-        logger.info(f"Found {len(positions)} total positions")
+        # Get current price (optional, will use from chain if missing)
+        current_price = _safe_float(pos.get("averagePrice") or pos.get("lastPrice"))
+        if current_price is None:
+            # Try to get from marketValue / quantity
+            market_value = _safe_float(pos.get("marketValue"))
+            if market_value and quantity:
+                current_price = market_value / quantity
+            else:
+                current_price = _safe_float(instr.get("lastPrice"))
         
-        # Filter eligible positions (equities, long, quantity >= 100)
-        for pos in positions:
-            if not isinstance(pos, dict):
-                continue
-            
-            instr = pos.get("instrument") or {}
-            asset_type = instr.get("assetType")
-            symbol = instr.get("symbol") or instr.get("underlyingSymbol") or ""
-            
-            # Only equities
-            if asset_type not in ("EQUITY", "STOCK"):
-                continue
-            
-            # Get quantity (long only)
-            quantity = _safe_float(pos.get("longQuantity") or pos.get("quantity"), 0.0) or 0.0
-            if quantity < 100:
-                continue
-            
-            # Get current price
-            current_price = _safe_float(pos.get("averagePrice") or pos.get("lastPrice"))
-            if current_price is None:
-                # Try to get from marketValue / quantity
-                market_value = _safe_float(pos.get("marketValue"))
-                if market_value and quantity:
-                    current_price = market_value / quantity
-                else:
-                    current_price = _safe_float(instr.get("lastPrice"))
-            
-            eligible_positions.append({
-                "symbol": symbol,
-                "quantity": quantity,
-                "current_price": current_price,
-                "asset_type": asset_type,
-                "raw_position": pos,
-            })
-        
-        logger.info(f"Found {len(eligible_positions)} eligible positions (equity, long, >=100 shares)")
+        eligible_positions.append({
+            "symbol": symbol,
+            "quantity": quantity,
+            "current_price": current_price,
+            "asset_type": asset_type,
+            "raw_position": pos,
+        })
     
-    # Limit to CC_PICKS_N
-    eligible_positions = eligible_positions[:CC_PICKS_N]
+    logger.info(f"Found {len(eligible_positions)} eligible positions (equity, long, qty > 0)")
     
     if not eligible_positions:
-        logger.warning(f"No eligible positions found (mode={mode})")
+        logger.warning("No eligible positions found")
         return
     
-    # 3) Get candidate data for these tickers (for copying fields and earnings lookup)
+    # 3) Get candidate data for earnings lookup
     ticker_symbols = [p["symbol"] for p in eligible_positions]
     candidates_map: Dict[str, Dict[str, Any]] = {}
     if ticker_symbols:
@@ -496,14 +566,7 @@ def main() -> None:
         except Exception as e:
             logger.warning(f"Could not fetch candidate data: {e}")
     
-    # 4) Initialize FMP client for earnings lookup fallback (optional)
-    fmp: Optional[FMPStableClient] = None
-    try:
-        fmp = FMPStableClient()
-    except Exception as e:
-        logger.debug(f"FMP client not available for earnings lookup: {e}")
-    
-    # 5) Fetch option chains and build picks
+    # 4) Fetch option chains and build picks
     md = SchwabMarketDataClient()
     
     pick_rows: List[Dict[str, Any]] = []
@@ -518,7 +581,6 @@ def main() -> None:
     skipped_spread = 0
     skipped_open_interest = 0
     skipped_not_otm = 0
-    skipped_no_shares = 0
     
     # Earnings tracking
     earnings_known = 0
@@ -534,10 +596,6 @@ def main() -> None:
         if not ticker:
             continue
         
-        if quantity < 100:
-            skipped_no_shares += 1
-            continue
-        
         try:
             # Load earnings_in_days from candidate data
             candidate = candidates_map.get(ticker)
@@ -549,33 +607,6 @@ def main() -> None:
                     # Try to load from metrics JSON
                     metrics = candidate.get("metrics") or {}
                     earnings_in_days = metrics.get("earnings_in_days")
-            
-            # Fallback to FMP if candidate data not available (best-effort, don't fail)
-            if earnings_in_days is None and fmp:
-                try:
-                    # Try FMP earnings calendar (best-effort)
-                    from apps.worker.src.utils.symbols import normalize_for_fmp
-                    normalized_ticker = normalize_for_fmp(ticker)
-                    earnings_cal = fmp._get("earnings-calendar", params={"symbol": normalized_ticker})
-                    if earnings_cal:
-                        if isinstance(earnings_cal, list) and earnings_cal:
-                            for item in earnings_cal:
-                                if isinstance(item, dict):
-                                    earnings_date_str = item.get("date") or item.get("earningsDate")
-                                    if earnings_date_str:
-                                        try:
-                                            if isinstance(earnings_date_str, str):
-                                                if "T" in earnings_date_str:
-                                                    earnings_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
-                                                else:
-                                                    earnings_date = date.fromisoformat(earnings_date_str[:10])
-                                                if earnings_date > now:
-                                                    earnings_in_days = (earnings_date - now).days
-                                                    break
-                                        except Exception:
-                                            pass
-                except Exception:
-                    pass  # Best-effort, don't fail
             
             # Track earnings statistics
             if earnings_in_days is not None:
@@ -598,7 +629,7 @@ def main() -> None:
                 logger.warning(f"{ticker}: no option chain returned")
                 continue
             
-            # Get underlying price from chain if current_price is missing (especially in test mode)
+            # Get underlying price from chain if current_price is missing
             if current_price is None:
                 current_price = _safe_float(chain.get("underlyingPrice") if isinstance(chain, dict) else None)
                 if current_price is None:
@@ -606,99 +637,117 @@ def main() -> None:
                     logger.warning(f"{ticker}: cannot determine current price for OTM filter")
                     continue
             
-            # Parse expirations and pick expiration using tiered strategy
+            # Parse expirations
             expirations = _parse_expirations_from_chain(chain)
             if not expirations:
                 skipped_no_contract_in_dte += 1
                 logger.warning(f"{ticker}: no expirations found in chain")
                 continue
+
+            # Try primary window first
+            best, exp, diag_primary = attempt_window(
+                window_name="primary",
+                min_dte=rules.dte_min_primary,
+                max_dte=rules.dte_max_primary,
+                chain=chain,
+                expirations=expirations,
+                current_price=current_price,
+                rules=rules,
+                allow_itm=ALLOW_ITM_CALLS,
+                now=now,
+            )
             
-            # Try expiration selection with fallback
-            exp, window_used = _pick_expiration_with_fallback(expirations, rules, now=now)
-            if not exp:
-                skipped_no_contract_in_dte += 1
-                # Log available expirations with their DTEs
-                exp_dtes = [(e, (e - now).days) for e in expirations if e > now]
-                exp_str = ", ".join([f"{e.isoformat()}(dte={dte})" for e, dte in sorted(exp_dtes, key=lambda x: x[1])])
-                logger.warning(
-                    f"{ticker}: no expiration in DTE windows "
-                    f"(primary=[{rules.dte_min_primary},{rules.dte_max_primary}], "
-                    f"fallback=[{rules.dte_min_fallback},{rules.dte_max_fallback}], "
-                    f"allow_fallback={rules.allow_fallback_dte}). "
-                    f"Available: {exp_str}"
+            window_used = None
+            fallback_attempted = False
+            diag_fallback = None
+            
+            if best:
+                # Success in primary window
+                window_used = "primary"
+            else:
+                # No pick in primary - check if we should try fallback
+                should_try_fallback = (
+                    rules.allow_fallback_dte and
+                    (diag_primary["in_delta"] == 0 or 
+                     (diag_primary["in_delta"] > 0 and diag_primary["spread_ok"] == 0))
                 )
-                continue
-            
-            # Extract CALL options for this expiration
-            calls = _extract_call_options_for_exp(chain, exp)
-            if not calls:
-                skipped_delta_missing += 1
-                logger.warning(f"{ticker}: no CALLs extracted for exp={exp}")
-                continue
-            
-            # Count diagnostics BEFORE filtering
-            diag_counts = _count_call_contracts_diagnostics(
-                calls,
-                target_delta_low=rules.cc_delta_min,
-                target_delta_high=rules.cc_delta_max,
-                current_price=current_price,
-                rules=rules,
-                allow_itm=ALLOW_ITM_CALLS,
-            )
-            
-            # Choose best CALL in delta band [CC_DELTA_MIN, CC_DELTA_MAX]
-            best = _choose_best_call_in_delta_band(
-                calls,
-                target_delta_low=rules.cc_delta_min,
-                target_delta_high=rules.cc_delta_max,
-                current_price=current_price,
-                expiration=exp,
-                rules=rules,
-                allow_itm=ALLOW_ITM_CALLS,
-            )
+                
+                if should_try_fallback:
+                    fallback_attempted = True
+                    logger.info(f"{ticker}: attempting fallback due to primary liquidity failure")
+                    
+                    # Try fallback window
+                    best_fallback, exp_fallback, diag_fallback = attempt_window(
+                        window_name="fallback",
+                        min_dte=rules.dte_min_fallback,
+                        max_dte=rules.dte_max_fallback,
+                        chain=chain,
+                        expirations=expirations,
+                        current_price=current_price,
+                        rules=rules,
+                        allow_itm=ALLOW_ITM_CALLS,
+                        now=now,
+                    )
+                    
+                    if best_fallback:
+                        # Success in fallback window
+                        best = best_fallback
+                        exp = exp_fallback
+                        window_used = "fallback"
+                    # else: fallback also failed - diag_fallback is set for logging
+
+            # If no pick was created, log diagnostics
             if not best:
+                # Use fallback diagnostics if fallback was attempted, otherwise use primary
+                diag_to_log = diag_fallback if (fallback_attempted and diag_fallback is not None) else diag_primary
+                
                 # Determine which filter failed based on diagnostics
-                if diag_counts["delta_present"] == 0:
+                skip_reason = diag_to_log.get("reason", "other")
+                
+                if skip_reason == "delta missing from Schwab":
                     skipped_delta_missing += 1
-                    skip_reason = "delta missing from Schwab"
-                elif diag_counts["in_delta"] == 0:
+                elif skip_reason == "delta out of band":
                     skipped_delta_out_of_band += 1
-                    skip_reason = "delta out of band"
-                elif diag_counts["bid_ok"] == 0:
+                elif "bid <" in skip_reason:
                     skipped_bid_zero += 1
-                    skip_reason = f"bid < ${rules.min_bid:.2f}"
-                elif diag_counts["spread_ok"] == 0:
+                elif "spread" in skip_reason:
                     skipped_spread += 1
-                    skip_reason = "spread failed (pct or abs)"
-                elif diag_counts["oi_ok"] == 0:
+                elif "oi <" in skip_reason:
                     skipped_open_interest += 1
-                    skip_reason = f"oi < {rules.min_open_interest}"
-                elif diag_counts["otm_ok"] == 0:
+                elif "no OTM calls" in skip_reason:
                     skipped_not_otm += 1
-                    skip_reason = "no OTM calls" if not ALLOW_ITM_CALLS else "other"
                 else:
-                    skipped_delta_out_of_band += 1
-                    skip_reason = "other"
+                    skipped_delta_out_of_band += 1  # Default fallback
                 
                 # Log ONE warning line with diagnostics
                 log_msg = (
                     f"{ticker}: no pick | "
-                    f"calls_total={diag_counts['calls_total']} "
-                    f"delta_present={diag_counts['delta_present']} "
-                    f"in_delta={diag_counts['in_delta']} "
-                    f"bid_ok={diag_counts['bid_ok']} "
-                    f"spread_ok={diag_counts['spread_ok']} "
-                    f"oi_ok={diag_counts['oi_ok']} "
-                    f"otm_ok={diag_counts['otm_ok']}"
+                    f"calls_total={diag_to_log['calls_total']} "
+                    f"delta_present={diag_to_log['delta_present']} "
+                    f"in_delta={diag_to_log['in_delta']} "
+                    f"bid_ok={diag_to_log['bid_ok']} "
+                    f"spread_ok={diag_to_log['spread_ok']} "
+                    f"oi_ok={diag_to_log['oi_ok']} "
+                    f"otm_ok={diag_to_log['otm_ok']} "
+                    f"fallback_attempted={fallback_attempted}"
                 )
-                if diag_counts["delta_present"] == 0:
+                
+                if diag_to_log["delta_present"] == 0:
                     log_msg += " (delta missing from Schwab)"
                 else:
                     log_msg += f" | reason={skip_reason}"
                 
+                # If fallback was attempted, include fallback diagnostics
+                if fallback_attempted and diag_fallback is not None:
+                    log_msg += (
+                        f" | fallback: calls_total={diag_fallback['calls_total']} "
+                        f"in_delta={diag_fallback['in_delta']} spread_ok={diag_fallback['spread_ok']} "
+                        f"reason={diag_fallback.get('reason', 'unknown')}"
+                    )
+                
                 logger.warning(log_msg)
                 continue
-            
+
             # Extract values
             strike = _safe_float(best.get("strike"))
             premium = _safe_float(best.get("_premium"))
@@ -707,7 +756,10 @@ def main() -> None:
             ask = _safe_float(best.get("ask"), 0.0) or 0.0
             dte = (exp - now).days
             ann_yld = _safe_float(best.get("_annualized_yield"))
-            
+            mid = _safe_float(best.get("_mid")) or ((bid + ask) / 2.0 if (bid > 0 and ask > 0) else premium)
+            spread_abs = _safe_float(best.get("_spread_abs")) or (ask - bid if (ask > bid) else 0.0)
+            spread_pct = _safe_float(best.get("_spread_pct")) or ((spread_abs / mid) * 100.0 if mid > 0 else 0.0)
+
             # Log successful pick with window used
             logger.info(
                 f"{ticker}: CC pick created | window={window_used} | "
@@ -715,16 +767,14 @@ def main() -> None:
                 f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
                 f"shares={quantity}"
             )
-            
+
             # Get RSI period/interval from candidate metrics or use defaults
             candidate_metrics = candidate.get("metrics") if candidate else {}
-            rsi_period = candidate_metrics.get("rsi_period") if isinstance(candidate_metrics, dict) else None
-            rsi_interval = candidate_metrics.get("rsi_interval") if isinstance(candidate_metrics, dict) else None
-            if not rsi_period:
-                rsi_period = rules.rsi_period
-            if not rsi_interval:
-                rsi_interval = rules.rsi_interval
-            
+            if not isinstance(candidate_metrics, dict):
+                candidate_metrics = {}
+            rsi_period = candidate_metrics.get("rsi_period") or rules.rsi_period
+            rsi_interval = candidate_metrics.get("rsi_interval") or rules.rsi_interval
+
             pick_rows.append({
                 "run_id": run_id,
                 "ticker": ticker,
@@ -744,7 +794,7 @@ def main() -> None:
                 "iv_rank": candidate.get("iv_rank") if candidate else None,
                 "beta": candidate.get("beta") if candidate else None,
                 "rsi": candidate.get("rsi") if candidate else None,
-                "earn_in_days": earnings_in_days,  # Use the loaded value
+                "earn_in_days": earnings_in_days,
                 "sentiment_score": candidate.get("sentiment_score") if candidate else None,
                 "pick_metrics": {
                     "rule_context": {
@@ -754,19 +804,10 @@ def main() -> None:
                         "rsi_period": rsi_period,
                         "rsi_interval": rsi_interval,
                         "allow_itm_calls": ALLOW_ITM_CALLS,
-                        "liquidity": {
-                            "max_spread_pct": rules.max_spread_pct,
-                            "min_bid": rules.min_bid,
-                            "min_open_interest": rules.min_open_interest,
-                            "max_abs_spread_low_premium": rules.max_abs_spread_low_premium,
-                            "max_abs_spread_high_premium": rules.max_abs_spread_high_premium,
-                        },
-                        "earnings_in_days": earnings_in_days,
                     },
                     "expiration": exp.isoformat(),
                     "quantity": quantity,
                     "current_price": current_price,
-                    "mode": mode,
                     "chain_raw_sample": {
                         "underlyingPrice": chain.get("underlyingPrice") if isinstance(chain, dict) else None,
                     },
@@ -776,6 +817,10 @@ def main() -> None:
                         "delta": delta,
                         "bid": best.get("bid"),
                         "ask": best.get("ask"),
+                        "mid": mid,
+                        "spread_abs": spread_abs,
+                        "spread_pct": spread_pct,
+                        "annualized_yield": ann_yld,
                         "openInterest": best.get("openInterest"),
                         "volume": best.get("totalVolume") or best.get("volume"),
                         "inTheMoney": best.get("inTheMoney"),
@@ -784,15 +829,15 @@ def main() -> None:
                     },
                 },
             })
-            
+
         except Exception as e:
             skipped_no_chain += 1
             logger.exception(f"{ticker}: failed to build CC pick: {e}")
-    
+
     # Log summary with skip counts by reason
     logger.info(
-        f"CC pick generation summary (mode={mode}): "
-        f"processed_positions={len(eligible_positions)}, "
+        f"CC pick generation summary: "
+        f"processed={len(eligible_positions)}, "
         f"created={len(pick_rows)}, "
         f"skipped_earnings_blocked={skipped_earnings_blocked}, "
         f"earnings_known={earnings_known}, earnings_unknown={earnings_unknown}, "
@@ -803,30 +848,14 @@ def main() -> None:
         f"skipped_bid_zero={skipped_bid_zero}, "
         f"skipped_spread={skipped_spread}, "
         f"skipped_open_interest={skipped_open_interest}, "
-        f"skipped_not_otm={skipped_not_otm}, "
-        f"skipped_no_shares={skipped_no_shares}"
+        f"skipped_not_otm={skipped_not_otm}"
     )
-    
-    # Log top-10 summary of selected contracts
-    if pick_rows:
-        top10 = sorted(pick_rows, key=lambda x: x.get("annualized_yield") or 0.0, reverse=True)[:10]
-        logger.info("Top 10 CC picks by annualized yield:")
-        for i, pick in enumerate(top10, start=1):
-            ticker = pick.get("ticker")
-            yield_pct = pick.get("annualized_yield", 0.0) * 100.0
-            strike = pick.get("strike")
-            dte = pick.get("dte")
-            delta = pick.get("delta")
-            logger.info(
-                f"  {i}. {ticker}: {yield_pct:.2f}% yield | "
-                f"strike={strike} | dte={dte} | delta={delta:.3f}"
-            )
-    
+
     if not pick_rows:
-        logger.warning(f"No CC picks were generated (mode={mode}).")
+        logger.warning("No CC picks were generated.")
         return
     
-    # 6) Delete existing CC picks for this run_id, then insert new ones
+    # 5) Delete existing CC picks for this run_id, then insert new ones
     logger.info(f"Deleting existing CC picks for run_id={run_id}")
     delete_res = (
         sb.table("screening_picks")
@@ -835,8 +864,8 @@ def main() -> None:
         .eq("action", "CC")
         .execute()
     )
-    
-    # 7) Insert new picks (batch insert)
+
+    # 6) Insert new picks (batch insert)
     logger.info(f"Inserting {len(pick_rows)} screening_picks rows...")
     insert_res = sb.table("screening_picks").insert(pick_rows).execute()
     
@@ -844,7 +873,7 @@ def main() -> None:
     if hasattr(insert_res, "error") and insert_res.error:
         raise RuntimeError(f"Supabase error inserting picks: {insert_res.error}")
     
-    logger.info(f"✅ build_cc_picks complete. Created {len(pick_rows)} CC picks for run_id={run_id} (mode={mode})")
+    logger.info(f"✅ build_cc_picks complete. Created {len(pick_rows)} CC picks for run_id={run_id}")
 
 
 if __name__ == "__main__":
