@@ -4,21 +4,12 @@ Uses https://financialmodelingprep.com/stable base URL.
 """
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import date, timedelta
 
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from loguru import logger
-
-# Import symbol normalization utility
-try:
-    from apps.worker.src.utils.symbols import normalize_for_fmp
-except ImportError:
-    # Fallback if import fails (e.g., in some environments)
-    def normalize_for_fmp(symbol: str) -> str:
-        """Fallback: return symbol as-is if utils module not available."""
-        return symbol
 
 BASE_URL = "https://financialmodelingprep.com/stable"
 VERSION = "fmp_stable_v1"
@@ -29,6 +20,29 @@ def _redact_apikey(url: str) -> str:
     return re.sub(r"(apikey=)[^&]+", r"\1REDACTED", url)
 
 
+def _normalize_symbol_for_fmp(symbol: str) -> str:
+    """
+    Normalize symbol for FMP API requests.
+    
+    Behavior:
+    - Strip whitespace
+    - Uppercase
+    - Replace "." with "-" (e.g., BRK.B -> BRK-B)
+    
+    Args:
+        symbol: Stock symbol (e.g., "BRK.B" or "AAPL")
+        
+    Returns:
+        Normalized symbol (e.g., "BRK-B" or "AAPL")
+    """
+    if not symbol:
+        return symbol
+    normalized = symbol.strip().upper()
+    # Replace "." with "-" for class shares (e.g., BRK.B -> BRK-B)
+    normalized = normalized.replace(".", "-")
+    return normalized
+
+
 class FMPStableClient:
     """Client for Financial Modeling Prep API using stable endpoints only."""
 
@@ -37,11 +51,39 @@ class FMPStableClient:
         if not self.api_key:
             raise RuntimeError("Missing FMP_API_KEY environment variable")
         self.timeout = timeout
+        # Cache for 402-blocked endpoint+symbol combinations
+        # Set of tuples: (endpoint_name, normalized_symbol)
+        self._blocked: Set[Tuple[str, str]] = set()
+
+    def _is_blocked(self, endpoint: str, normalized_symbol: str) -> bool:
+        """
+        Check if endpoint+symbol combination is blocked (returned 402 previously).
+        
+        Args:
+            endpoint: Endpoint name (e.g., "quote", "financial-scores")
+            normalized_symbol: Normalized symbol (e.g., "BRK-B")
+            
+        Returns:
+            True if blocked, False otherwise
+        """
+        return (endpoint, normalized_symbol) in self._blocked
+
+    def _mark_blocked(self, endpoint: str, normalized_symbol: str) -> None:
+        """
+        Mark endpoint+symbol combination as blocked (returned 402).
+        
+        Args:
+            endpoint: Endpoint name
+            normalized_symbol: Normalized symbol
+        """
+        self._blocked.add((endpoint, normalized_symbol))
 
     def _get(
         self,
         endpoint: str,
         params: Optional[Dict[str, Any]] = None,
+        check_blocked: bool = False,
+        normalized_symbol: Optional[str] = None,
     ) -> Any:
         """
         Make GET request to FMP stable API.
@@ -49,13 +91,21 @@ class FMPStableClient:
         Args:
             endpoint: Endpoint path (e.g., "profile" or "company-screener")
             params: Query parameters (apikey will be added automatically)
+            check_blocked: If True, check blocked cache before making request
+            normalized_symbol: Normalized symbol (required if check_blocked=True)
             
         Returns:
             JSON response data, or None on 404
             
         Raises:
-            requests.HTTPError: On HTTP errors (except 404 which returns None)
+            requests.HTTPError: On HTTP errors (except 404 which returns None, 402 handled specially)
         """
+        # Check blocked cache if requested
+        if check_blocked and normalized_symbol:
+            if self._is_blocked(endpoint, normalized_symbol):
+                logger.debug(f"FMP {endpoint}({normalized_symbol}): skipping (402-blocked)")
+                return None
+        
         params = params or {}
         params["apikey"] = self.api_key
 
@@ -63,6 +113,20 @@ class FMPStableClient:
         
         try:
             response = requests.get(url, params=params, timeout=self.timeout)
+            
+            # Handle 402 Payment Required (subscription tier)
+            if response.status_code == 402:
+                if check_blocked and normalized_symbol:
+                    # Mark as blocked and log warning once
+                    self._mark_blocked(endpoint, normalized_symbol)
+                    logger.warning(
+                        f"FMP {endpoint}({normalized_symbol}): 402 Payment Required (subscription tier) - "
+                        f"blocking future calls for this endpoint+symbol"
+                    )
+                else:
+                    # For non-symbol endpoints, just log warning
+                    logger.warning(f"FMP {endpoint}: 402 Payment Required (subscription tier)")
+                return None
             
             # Don't retry 404s (resource doesn't exist)
             if response.status_code == 404:
@@ -73,6 +137,18 @@ class FMPStableClient:
             return response.json()
             
         except requests.HTTPError as e:
+            # Handle 402 in exception path (if not caught above)
+            if hasattr(e, 'response') and e.response and e.response.status_code == 402:
+                if check_blocked and normalized_symbol:
+                    self._mark_blocked(endpoint, normalized_symbol)
+                    logger.warning(
+                        f"FMP {endpoint}({normalized_symbol}): 402 Payment Required (subscription tier) - "
+                        f"blocking future calls for this endpoint+symbol"
+                    )
+                else:
+                    logger.warning(f"FMP {endpoint}: 402 Payment Required (subscription tier)")
+                return None
+            
             safe_url_full = _redact_apikey(str(e.response.url) if hasattr(e, 'response') and e.response else url)
             raise requests.HTTPError(
                 f"FMP Stable API error: {e.response.status_code} {e.response.reason} | "
@@ -145,9 +221,11 @@ class FMPStableClient:
             Dictionary with profile data, or {} if not found
         """
         original_symbol = symbol
-        symbol = normalize_for_fmp(symbol)
+        normalized_symbol = _normalize_symbol_for_fmp(symbol)
         try:
-            data = self._get("profile", params={"symbol": symbol})
+            data = self._get("profile", params={"symbol": normalized_symbol}, check_blocked=True, normalized_symbol=normalized_symbol)
+            if data is None:
+                return {}
             if isinstance(data, list) and data:
                 return data[0]
             if isinstance(data, dict):
@@ -156,10 +234,10 @@ class FMPStableClient:
         except requests.HTTPError as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 404:
                 return {}
-            logger.warning(f"FMP profile({original_symbol} -> {symbol}) failed: {e}")
+            logger.warning(f"FMP profile({original_symbol} -> {normalized_symbol}) failed: {e}")
             return {}
         except Exception as e:
-            logger.warning(f"FMP profile({original_symbol} -> {symbol}) unexpected error: {e}")
+            logger.warning(f"FMP profile({original_symbol} -> {normalized_symbol}) unexpected error: {e}")
             return {}
 
     @retry(
@@ -178,9 +256,11 @@ class FMPStableClient:
             Dictionary with quote data, or {} if not found
         """
         original_symbol = symbol
-        symbol = normalize_for_fmp(symbol)
+        normalized_symbol = _normalize_symbol_for_fmp(symbol)
         try:
-            data = self._get("quote", params={"symbol": symbol})
+            data = self._get("quote", params={"symbol": normalized_symbol}, check_blocked=True, normalized_symbol=normalized_symbol)
+            if data is None:
+                return {}
             if isinstance(data, list) and data:
                 return data[0]
             if isinstance(data, dict):
@@ -189,10 +269,10 @@ class FMPStableClient:
         except requests.HTTPError as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 404:
                 return {}
-            logger.warning(f"FMP quote({original_symbol} -> {symbol}) failed: {e}")
+            logger.warning(f"FMP quote({original_symbol} -> {normalized_symbol}) failed: {e}")
             return {}
         except Exception as e:
-            logger.warning(f"FMP quote({original_symbol} -> {symbol}) unexpected error: {e}")
+            logger.warning(f"FMP quote({original_symbol} -> {normalized_symbol}) unexpected error: {e}")
             return {}
 
     @retry(
@@ -211,9 +291,11 @@ class FMPStableClient:
             Dictionary with metrics, or {} if not found
         """
         original_symbol = symbol
-        symbol = normalize_for_fmp(symbol)
+        normalized_symbol = _normalize_symbol_for_fmp(symbol)
         try:
-            data = self._get("key-metrics-ttm", params={"symbol": symbol})
+            data = self._get("key-metrics-ttm", params={"symbol": normalized_symbol}, check_blocked=True, normalized_symbol=normalized_symbol)
+            if data is None:
+                return {}
             if isinstance(data, list) and data:
                 return data[0]
             if isinstance(data, dict):
@@ -222,10 +304,10 @@ class FMPStableClient:
         except requests.HTTPError as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 404:
                 return {}
-            logger.warning(f"FMP key_metrics_ttm({original_symbol} -> {symbol}) failed: {e}")
+            logger.warning(f"FMP key_metrics_ttm({original_symbol} -> {normalized_symbol}) failed: {e}")
             return {}
         except Exception as e:
-            logger.warning(f"FMP key_metrics_ttm({original_symbol} -> {symbol}) unexpected error: {e}")
+            logger.warning(f"FMP key_metrics_ttm({original_symbol} -> {normalized_symbol}) unexpected error: {e}")
             return {}
 
     @retry(
@@ -244,9 +326,11 @@ class FMPStableClient:
             Dictionary with ratios, or {} if not found
         """
         original_symbol = symbol
-        symbol = normalize_for_fmp(symbol)
+        normalized_symbol = _normalize_symbol_for_fmp(symbol)
         try:
-            data = self._get("ratios-ttm", params={"symbol": symbol})
+            data = self._get("ratios-ttm", params={"symbol": normalized_symbol}, check_blocked=True, normalized_symbol=normalized_symbol)
+            if data is None:
+                return {}
             if isinstance(data, list) and data:
                 return data[0]
             if isinstance(data, dict):
@@ -255,10 +339,10 @@ class FMPStableClient:
         except requests.HTTPError as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 404:
                 return {}
-            logger.warning(f"FMP ratios_ttm({original_symbol} -> {symbol}) failed: {e}")
+            logger.warning(f"FMP ratios_ttm({original_symbol} -> {normalized_symbol}) failed: {e}")
             return {}
         except Exception as e:
-            logger.warning(f"FMP ratios_ttm({original_symbol} -> {symbol}) unexpected error: {e}")
+            logger.warning(f"FMP ratios_ttm({original_symbol} -> {normalized_symbol}) unexpected error: {e}")
             return {}
 
     @retry(
@@ -278,9 +362,11 @@ class FMPStableClient:
             List of news items, or [] on error
         """
         original_symbol = symbol
-        symbol = normalize_for_fmp(symbol)
+        normalized_symbol = _normalize_symbol_for_fmp(symbol)
         try:
-            data = self._get("stock-news", params={"tickers": symbol, "limit": limit})
+            data = self._get("stock-news", params={"tickers": normalized_symbol, "limit": limit}, check_blocked=True, normalized_symbol=normalized_symbol)
+            if data is None:
+                return []
             if isinstance(data, list):
                 return data[:limit]
             if isinstance(data, dict):
@@ -289,10 +375,10 @@ class FMPStableClient:
         except requests.HTTPError as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 404:
                 return []
-            logger.warning(f"FMP stock_news({original_symbol} -> {symbol}) failed: {e}")
+            logger.warning(f"FMP stock_news({original_symbol} -> {normalized_symbol}) failed: {e}")
             return []
         except Exception as e:
-            logger.warning(f"FMP stock_news({original_symbol} -> {symbol}) unexpected error: {e}")
+            logger.warning(f"FMP stock_news({original_symbol} -> {normalized_symbol}) unexpected error: {e}")
             return []
 
     @retry(
@@ -320,7 +406,7 @@ class FMPStableClient:
             RSI value (float) if available, None otherwise
         """
         original_symbol = symbol
-        symbol = normalize_for_fmp(symbol)
+        normalized_symbol = _normalize_symbol_for_fmp(symbol)
         try:
             # Convert interval format: "daily" -> "1day", "weekly" -> "1week", etc.
             timeframe_map = {
@@ -335,11 +421,14 @@ class FMPStableClient:
             
             # FMP endpoint uses periodLength and timeframe (not period and interval)
             params = {
-                "symbol": symbol,
+                "symbol": normalized_symbol,
                 "periodLength": period,
                 "timeframe": timeframe,
             }
-            data = self._get("technical-indicators/rsi", params=params)
+            data = self._get("technical-indicators/rsi", params=params, check_blocked=True, normalized_symbol=normalized_symbol)
+            
+            if data is None:
+                return None
             
             # Handle various response formats
             if isinstance(data, list) and data:
@@ -365,7 +454,7 @@ class FMPStableClient:
             # 404 or other errors - return None (indicator not available)
             return None
         except Exception as e:
-            logger.debug(f"FMP technical_indicator_rsi({original_symbol} -> {symbol}) error: {e}")
+            logger.debug(f"FMP technical_indicator_rsi({original_symbol} -> {normalized_symbol}) error: {e}")
             return None
 
     @retry(
@@ -384,27 +473,24 @@ class FMPStableClient:
             Dictionary with financial scores, or {} if not found or on error
         """
         original_symbol = symbol
-        symbol = normalize_for_fmp(symbol)
+        normalized_symbol = _normalize_symbol_for_fmp(symbol)
         try:
-            data = self._get("financial-scores", params={"symbol": symbol})
+            data = self._get("financial-scores", params={"symbol": normalized_symbol}, check_blocked=True, normalized_symbol=normalized_symbol)
+            if data is None:
+                return {}
             if isinstance(data, list) and data:
                 return data[0]
             if isinstance(data, dict):
                 return data
             return {}
         except requests.HTTPError as e:
-            # Handle 402 Payment Required and 404 gracefully
-            if hasattr(e, 'response') and e.response:
-                status_code = e.response.status_code
-                if status_code == 402:
-                    logger.warning(f"FMP financial_scores({original_symbol} -> {symbol}) failed: 402 Payment Required (subscription tier)")
-                    return {}
-                if status_code == 404:
-                    return {}
-            logger.warning(f"FMP financial_scores({original_symbol} -> {symbol}) failed: {e}")
+            # Handle 404 gracefully
+            if hasattr(e, 'response') and e.response and e.response.status_code == 404:
+                return {}
+            logger.warning(f"FMP financial_scores({original_symbol} -> {normalized_symbol}) failed: {e}")
             return {}
         except Exception as e:
-            logger.warning(f"FMP financial_scores({original_symbol} -> {symbol}) unexpected error: {e}")
+            logger.warning(f"FMP financial_scores({original_symbol} -> {normalized_symbol}) unexpected error: {e}")
             return {}
 
     @retry(
@@ -430,16 +516,18 @@ class FMPStableClient:
             List of growth records (most recent first), or [] if not found or on error
         """
         original_symbol = symbol
-        symbol = normalize_for_fmp(symbol)
+        normalized_symbol = _normalize_symbol_for_fmp(symbol)
         try:
-            params = {"symbol": symbol}
+            params = {"symbol": normalized_symbol}
             # Include period and limit if endpoint supports them
             if period:
                 params["period"] = period
             if limit:
                 params["limit"] = limit
             
-            data = self._get("financial-statement-growth", params=params)
+            data = self._get("financial-statement-growth", params=params, check_blocked=True, normalized_symbol=normalized_symbol)
+            if data is None:
+                return []
             if isinstance(data, list):
                 # Return most recent records (limit to <= 5 to avoid large payloads)
                 return data[:min(limit, 5)]
@@ -447,18 +535,13 @@ class FMPStableClient:
                 return [data]
             return []
         except requests.HTTPError as e:
-            # Handle 402 Payment Required and 404 gracefully
-            if hasattr(e, 'response') and e.response:
-                status_code = e.response.status_code
-                if status_code == 402:
-                    logger.warning(f"FMP financial_statement_growth({original_symbol} -> {symbol}) failed: 402 Payment Required (subscription tier)")
-                    return []
-                if status_code == 404:
-                    return []
-            logger.warning(f"FMP financial_statement_growth({original_symbol} -> {symbol}) failed: {e}")
+            # Handle 404 gracefully
+            if hasattr(e, 'response') and e.response and e.response.status_code == 404:
+                return []
+            logger.warning(f"FMP financial_statement_growth({original_symbol} -> {normalized_symbol}) failed: {e}")
             return []
         except Exception as e:
-            logger.warning(f"FMP financial_statement_growth({original_symbol} -> {symbol}) unexpected error: {e}")
+            logger.warning(f"FMP financial_statement_growth({original_symbol} -> {normalized_symbol}) unexpected error: {e}")
             return []
 
 
