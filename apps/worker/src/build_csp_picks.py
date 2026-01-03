@@ -43,6 +43,7 @@ MAX_ANNUALIZED_YIELD = float(os.getenv("MAX_ANNUALIZED_YIELD", "3.0"))
 WHEEL_CSP_MAX_TRADES = int(os.getenv("WHEEL_CSP_MAX_TRADES", "4"))
 WHEEL_CSP_MIN_CASH_BUFFER_PCT = float(os.getenv("WHEEL_CSP_MIN_CASH_BUFFER_PCT", "0.10"))
 WHEEL_CSP_MAX_CASH_PER_TRADE = float(os.getenv("WHEEL_CSP_MAX_CASH_PER_TRADE", "25000.0"))
+WHEEL_CASH_EQUIVALENT_SYMBOLS = os.getenv("WHEEL_CASH_EQUIVALENT_SYMBOLS", "SWVXX").strip()
 DEFAULT_PORTFOLIO_CASH = 50000.0  # Fallback if Schwab fetch fails
 
 
@@ -207,6 +208,84 @@ def _fetch_portfolio_budget_from_schwab() -> Tuple[float, str]:
     except Exception as e:
         logger.warning(f"Failed to fetch portfolio budget from Schwab: {e}. Using fallback budget.")
         return DEFAULT_PORTFOLIO_CASH, "fallback:exception"
+
+
+def _fetch_cash_equivalents_value() -> float:
+    """
+    Fetch market value of cash-equivalent positions (e.g., money market funds) from Schwab.
+    
+    Returns:
+        Sum of marketValue for positions matching cash equivalent symbols (case-insensitive)
+        Returns 0.0 if fetch fails or no matching positions found
+    """
+    try:
+        # Parse allowlist (comma-separated, case-insensitive)
+        if not WHEEL_CASH_EQUIVALENT_SYMBOLS:
+            return 0.0
+        
+        allowlist = {s.strip().upper() for s in WHEEL_CASH_EQUIVALENT_SYMBOLS.split(",") if s.strip()}
+        if not allowlist:
+            return 0.0
+        
+        schwab = SchwabClient.from_env()
+        positions_response = schwab.get_positions()
+        
+        if not isinstance(positions_response, dict):
+            logger.warning("Schwab positions response is not a dict, skipping cash equivalents")
+            return 0.0
+        
+        # Extract positions from common locations
+        positions = []
+        if isinstance(positions_response.get("securitiesAccount"), dict):
+            positions = positions_response["securitiesAccount"].get("positions") or []
+        elif isinstance(positions_response.get("positions"), list):
+            positions = positions_response["positions"]
+        
+        if not isinstance(positions, list):
+            logger.warning("Schwab positions response missing positions list, skipping cash equivalents")
+            return 0.0
+        
+        # Sum market value for matching positions
+        cash_equiv_value = 0.0
+        matched_symbols = []
+        
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            
+            # Get symbol (case-insensitive match)
+            instrument = pos.get("instrument") or {}
+            symbol = (instrument.get("symbol") or "").strip().upper()
+            if not symbol or symbol not in allowlist:
+                continue
+            
+            # Check asset type (MUTUAL_FUND or similar)
+            asset_type = (instrument.get("assetType") or "").upper()
+            if "MUTUAL_FUND" not in asset_type and "FUND" not in asset_type:
+                continue
+            
+            # Check quantity > 0
+            quantity = _safe_float(pos.get("longQuantity") or pos.get("quantity"), 0.0) or 0.0
+            if quantity <= 0:
+                continue
+            
+            # Get market value
+            market_value = _safe_float(pos.get("marketValue"), 0.0) or 0.0
+            if market_value > 0:
+                cash_equiv_value += market_value
+                matched_symbols.append(symbol)
+        
+        if cash_equiv_value > 0:
+            logger.info(
+                f"Cash equivalents: symbols={sorted(set(matched_symbols))} "
+                f"value=${cash_equiv_value:,.2f} (added to budget)"
+            )
+        
+        return cash_equiv_value
+        
+    except Exception as e:
+        logger.warning(f"Failed to fetch cash equivalents from Schwab: {e}. Proceeding with balances cash only.")
+        return 0.0
 
 
 def _determine_portfolio_budget() -> Tuple[float, str]:
@@ -1280,12 +1359,21 @@ def main() -> None:
 
     # Portfolio budget determination and selection
     portfolio_budget_cash, budget_source = _determine_portfolio_budget()
+    
+    # Add cash equivalents if budget is from Schwab (not env var)
+    cash_equiv_value = 0.0
+    if budget_source.startswith("schwab:"):
+        cash_equiv_value = _fetch_cash_equivalents_value()
+    
+    # Effective budget includes cash equivalents
+    effective_budget_cash = portfolio_budget_cash + cash_equiv_value
+    
     cash_buffer_pct = WHEEL_CSP_MIN_CASH_BUFFER_PCT
-    allocatable_cash = portfolio_budget_cash * (1.0 - cash_buffer_pct)
+    allocatable_cash = effective_budget_cash * (1.0 - cash_buffer_pct)
     
     logger.info(
         f"Portfolio budget: source={budget_source}, "
-        f"cash_budget=${portfolio_budget_cash:,.2f}, "
+        f"cash_budget=${effective_budget_cash:,.2f}, "
         f"buffer_pct={cash_buffer_pct:.1%}, "
         f"allocatable_cash=${allocatable_cash:,.2f}, "
         f"max_trades={WHEEL_CSP_MAX_TRADES}"
@@ -1330,13 +1418,17 @@ def main() -> None:
             # Store selection rank in metadata
             pick_rows[idx]["pick_metrics"]["metadata"]["portfolio"] = {
                 "budget_source": budget_source,
-                "cash_budget": portfolio_budget_cash,
+                "cash_budget": effective_budget_cash,
                 "cash_buffer_pct": cash_buffer_pct,
                 "allocatable_cash": allocatable_cash,
                 "required_cash": required_cash,
                 "required_cash_net": required_cash_net,
                 "max_cash_per_trade": WHEEL_CSP_MAX_CASH_PER_TRADE,
                 "skipped_due_to_trade_size": skipped_due_to_trade_size,
+                "budget_components": {
+                    "balances_cash": portfolio_budget_cash,
+                    "cash_equivalents": cash_equiv_value,
+                },
                 "selected": True,
                 "selection_rank": selection_rank,
                 "running_allocated_net": running_allocated_net,
@@ -1345,13 +1437,17 @@ def main() -> None:
             # Pick doesn't fit - mark as not selected
             pick_rows[idx]["pick_metrics"]["metadata"]["portfolio"] = {
                 "budget_source": budget_source,
-                "cash_budget": portfolio_budget_cash,
+                "cash_budget": effective_budget_cash,
                 "cash_buffer_pct": cash_buffer_pct,
                 "allocatable_cash": allocatable_cash,
                 "required_cash": required_cash,
                 "required_cash_net": required_cash_net,
                 "max_cash_per_trade": WHEEL_CSP_MAX_CASH_PER_TRADE,
                 "skipped_due_to_trade_size": skipped_due_to_trade_size,
+                "budget_components": {
+                    "balances_cash": portfolio_budget_cash,
+                    "cash_equivalents": cash_equiv_value,
+                },
                 "selected": False,
                 "selection_rank": None,
                 "running_allocated_net": None,
@@ -1362,7 +1458,7 @@ def main() -> None:
     logger.info(
         f"Portfolio selection: {selected_count}/{len(pick_rows)} picks selected, "
         f"allocated=${running_allocated_net:,.2f} / ${allocatable_cash:,.2f} allocatable "
-        f"(${portfolio_budget_cash:,.2f} budget with {cash_buffer_pct:.1%} buffer), "
+        f"(${effective_budget_cash:,.2f} budget with {cash_buffer_pct:.1%} buffer), "
         f"skipped_trade_too_large={skipped_portfolio_trade_too_large}"
     )
 
