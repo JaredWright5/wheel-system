@@ -295,6 +295,106 @@ def _choose_best_put_in_delta_band(
     return candidates[0]
 
 
+def _determine_skip_reason(diag_counts: Dict[str, int], rules) -> str:
+    """
+    Determine skip reason string from diagnostics.
+    
+    Returns:
+        Reason string like "delta out of band", "spread failed", etc.
+    """
+    if diag_counts["delta_present"] == 0:
+        return "delta missing from Schwab"
+    elif diag_counts["in_delta"] == 0:
+        return "delta out of band"
+    elif diag_counts["bid_ok"] == 0:
+        return f"bid < ${rules.min_bid:.2f}"
+    elif diag_counts["spread_ok"] == 0:
+        return "spread failed (pct or abs)"
+    elif diag_counts["oi_ok"] == 0:
+        return f"oi < {rules.min_open_interest}"
+    else:
+        return "other"
+
+
+def attempt_window(
+    window_name: str,
+    min_dte: int,
+    max_dte: int,
+    chain: Dict[str, Any],
+    expirations: List[date],
+    rules,
+    now: date,
+) -> Tuple[Optional[Dict[str, Any]], Optional[date], Dict[str, Any]]:
+    """
+    Attempt to find a valid PUT contract in a given DTE window.
+    
+    Args:
+        window_name: Name of window for logging (e.g., "primary", "fallback")
+        min_dte: Minimum DTE for the window
+        max_dte: Maximum DTE for the window
+        chain: Option chain from Schwab
+        expirations: List of available expiration dates
+        rules: WheelRules instance
+        now: Current date (UTC)
+        
+    Returns:
+        (best_contract or None, expiration_date or None, diagnostics_dict)
+        
+    Diagnostics dict includes:
+        - puts_total, delta_present, in_delta, bid_ok, spread_ok, oi_ok
+        - reason: skip reason string if no pick (or None if pick found)
+    """
+    # Find expiration in window
+    exp = find_expiration_in_window(expirations, min_dte=min_dte, max_dte=max_dte, now=now)
+    if not exp:
+        return None, None, {
+            "puts_total": 0,
+            "delta_present": 0,
+            "in_delta": 0,
+            "bid_ok": 0,
+            "spread_ok": 0,
+            "oi_ok": 0,
+            "reason": "no expiration in window",
+        }
+    
+    # Extract PUT options for this expiration
+    puts = _extract_put_options_for_exp(chain, exp)
+    if not puts:
+        return None, None, {
+            "puts_total": 0,
+            "delta_present": 0,
+            "in_delta": 0,
+            "bid_ok": 0,
+            "spread_ok": 0,
+            "oi_ok": 0,
+            "reason": "no PUTs extracted",
+        }
+    
+    # Count diagnostics BEFORE filtering
+    diag_counts = _count_put_contracts_diagnostics(
+        puts,
+        target_delta_low=rules.csp_delta_min,
+        target_delta_high=rules.csp_delta_max,
+        rules=rules,
+    )
+    
+    # Try to find best PUT in delta band
+    best = _choose_best_put_in_delta_band(
+        puts,
+        target_delta_low=rules.csp_delta_min,
+        target_delta_high=rules.csp_delta_max,
+        expiration=exp,
+        rules=rules,
+    )
+    
+    if best:
+        diag_counts["reason"] = None
+    else:
+        diag_counts["reason"] = _determine_skip_reason(diag_counts, rules)
+    
+    return best, exp, diag_counts
+
+
 # ---------- Main ----------
 
 def main() -> None:
@@ -432,192 +532,99 @@ def main() -> None:
                 continue
 
             # Try primary window first
-            exp_primary = find_expiration_in_window(
-                expirations,
+            best, exp, diag_primary = attempt_window(
+                window_name="primary",
                 min_dte=rules.dte_min_primary,
                 max_dte=rules.dte_max_primary,
+                chain=chain,
+                expirations=expirations,
+                rules=rules,
                 now=now,
             )
             
-            best = None
             window_used = None
             fallback_attempted = False
             
-            # Try primary window if available
-            if exp_primary:
-                # Extract PUT options for primary expiration
-                puts_primary = _extract_put_options_for_exp(chain, exp_primary)
-                if puts_primary:
-                    # Count diagnostics BEFORE filtering
-                    diag_counts_primary = _count_put_contracts_diagnostics(
-                        puts_primary,
-                        target_delta_low=rules.csp_delta_min,
-                        target_delta_high=rules.csp_delta_max,
-                        rules=rules,
-                    )
-                    
-                    # Try to find best PUT in primary window
-                    best = _choose_best_put_in_delta_band(
-                        puts_primary,
-                        target_delta_low=rules.csp_delta_min,
-                        target_delta_high=rules.csp_delta_max,
-                        expiration=exp_primary,
-                        rules=rules,
-                    )
-                    
-                    # If no pick but we had contracts in delta band, they all failed liquidity
-                    # Try fallback window if allowed
-                    if not best and diag_counts_primary["in_delta"] > 0 and rules.allow_fallback_dte:
-                        fallback_attempted = True
-                        logger.info(f"{ticker}: attempting fallback window due to primary liquidity failures")
-                        
-                        # Try fallback window
-                        exp_fallback = find_expiration_in_window(
-                            expirations,
-                            min_dte=rules.dte_min_fallback,
-                            max_dte=rules.dte_max_fallback,
-                            now=now,
-                        )
-                        
-                        if exp_fallback:
-                            # Extract PUT options for fallback expiration
-                            puts_fallback = _extract_put_options_for_exp(chain, exp_fallback)
-                            if puts_fallback:
-                                # Try to find best PUT in fallback window
-                                best = _choose_best_put_in_delta_band(
-                                    puts_fallback,
-                                    target_delta_low=rules.csp_delta_min,
-                                    target_delta_high=rules.csp_delta_max,
-                                    expiration=exp_fallback,
-                                    rules=rules,
-                                )
-                                
-                                if best:
-                                    window_used = "fallback"
-                                    exp = exp_fallback
-                                else:
-                                    # Fallback also failed - use primary diagnostics for logging
-                                    diag_counts = diag_counts_primary
-                            else:
-                                # No PUTs in fallback expiration
-                                diag_counts = diag_counts_primary
-                        else:
-                            # No fallback expiration available
-                            diag_counts = diag_counts_primary
-                    elif best:
-                        # Success in primary window
-                        window_used = "primary"
-                        exp = exp_primary
-                    else:
-                        # No pick in primary, but either no contracts in delta band or fallback not allowed
-                        diag_counts = diag_counts_primary
-                else:
-                    # No PUTs extracted for primary expiration
-                    diag_counts = None
+            if best:
+                # Success in primary window
+                window_used = "primary"
             else:
-                # No primary expiration available - try fallback if allowed
-                if rules.allow_fallback_dte:
-                    exp_fallback = find_expiration_in_window(
-                        expirations,
+                # No pick in primary - check if we should try fallback
+                should_try_fallback = (
+                    rules.allow_fallback_dte and
+                    (diag_primary["in_delta"] == 0 or 
+                     (diag_primary["in_delta"] > 0 and diag_primary["spread_ok"] == 0))
+                )
+                
+                if should_try_fallback:
+                    fallback_attempted = True
+                    logger.info(f"{ticker}: attempting fallback due to primary liquidity failure")
+                    
+                    # Try fallback window
+                    best_fallback, exp_fallback, diag_fallback = attempt_window(
+                        window_name="fallback",
                         min_dte=rules.dte_min_fallback,
                         max_dte=rules.dte_max_fallback,
+                        chain=chain,
+                        expirations=expirations,
+                        rules=rules,
                         now=now,
                     )
                     
-                    if exp_fallback:
-                        # Extract PUT options for fallback expiration
-                        puts_fallback = _extract_put_options_for_exp(chain, exp_fallback)
-                        if puts_fallback:
-                            # Count diagnostics
-                            diag_counts = _count_put_contracts_diagnostics(
-                                puts_fallback,
-                                target_delta_low=rules.csp_delta_min,
-                                target_delta_high=rules.csp_delta_max,
-                                rules=rules,
-                            )
-                            
-                            # Try to find best PUT in fallback window
-                            best = _choose_best_put_in_delta_band(
-                                puts_fallback,
-                                target_delta_low=rules.csp_delta_min,
-                                target_delta_high=rules.csp_delta_max,
-                                expiration=exp_fallback,
-                                rules=rules,
-                            )
-                            
-                            if best:
-                                window_used = "fallback"
-                                exp = exp_fallback
-                        else:
-                            diag_counts = None
+                    if best_fallback:
+                        # Success in fallback window
+                        best = best_fallback
+                        exp = exp_fallback
+                        window_used = "fallback"
                     else:
-                        # No fallback expiration available
-                        skipped_no_contract_in_dte += 1
-                        exp_dtes = [(e, (e - now).days) for e in expirations if e > now]
-                        exp_str = ", ".join([f"{e.isoformat()}(dte={dte})" for e, dte in sorted(exp_dtes, key=lambda x: x[1])])
-                        logger.warning(
-                            f"{ticker}: no expiration in DTE windows "
-                            f"(primary=[{rules.dte_min_primary},{rules.dte_max_primary}], "
-                            f"fallback=[{rules.dte_min_fallback},{rules.dte_max_fallback}], "
-                            f"allow_fallback={rules.allow_fallback_dte}). "
-                            f"Available: {exp_str}"
-                        )
-                        continue
-                else:
-                    # No primary expiration and fallback not allowed
-                    skipped_no_contract_in_dte += 1
-                    exp_dtes = [(e, (e - now).days) for e in expirations if e > now]
-                    exp_str = ", ".join([f"{e.isoformat()}(dte={dte})" for e, dte in sorted(exp_dtes, key=lambda x: x[1])])
-                    logger.warning(
-                        f"{ticker}: no expiration in DTE windows "
-                        f"(primary=[{rules.dte_min_primary},{rules.dte_max_primary}], "
-                        f"fallback=[{rules.dte_min_fallback},{rules.dte_max_fallback}], "
-                        f"allow_fallback={rules.allow_fallback_dte}). "
-                        f"Available: {exp_str}"
-                    )
-                    continue
-            
+                        # Fallback also failed - will use primary diagnostics for logging
+                        pass
+
             # If no pick was created, log diagnostics
             if not best:
+                # Use primary diagnostics if fallback wasn't attempted, otherwise use fallback
+                diag_to_log = diag_fallback if fallback_attempted else diag_primary
+                
                 # Determine which filter failed based on diagnostics
-                if diag_counts is None:
+                skip_reason = diag_to_log.get("reason", "other")
+                
+                if skip_reason == "delta missing from Schwab":
                     skipped_delta_missing += 1
-                    skip_reason = "no PUTs extracted"
-                elif diag_counts["delta_present"] == 0:
-                    skipped_delta_missing += 1
-                    skip_reason = "delta missing from Schwab"
-                elif diag_counts["in_delta"] == 0:
+                elif skip_reason == "delta out of band":
                     skipped_delta_out_of_band += 1
-                    skip_reason = "delta out of band"
-                elif diag_counts["bid_ok"] == 0:
+                elif "bid <" in skip_reason:
                     skipped_bid_zero += 1
-                    skip_reason = f"bid < ${rules.min_bid:.2f}"
-                elif diag_counts["spread_ok"] == 0:
+                elif "spread" in skip_reason:
                     skipped_spread += 1
-                    skip_reason = "spread failed (pct or abs)"
-                elif diag_counts["oi_ok"] == 0:
+                elif "oi <" in skip_reason:
                     skipped_open_interest += 1
-                    skip_reason = f"oi < {rules.min_open_interest}"
                 else:
-                    # Fallback to generic delta skip if diagnostics don't clearly indicate
-                    skipped_delta_out_of_band += 1
-                    skip_reason = "other"
+                    skipped_delta_out_of_band += 1  # Default fallback
                 
                 # Log ONE warning line with diagnostics
                 log_msg = (
                     f"{ticker}: no pick | "
-                    f"puts_total={diag_counts['puts_total'] if diag_counts else 0} "
-                    f"delta_present={diag_counts['delta_present'] if diag_counts else 0} "
-                    f"in_delta={diag_counts['in_delta'] if diag_counts else 0} "
-                    f"bid_ok={diag_counts['bid_ok'] if diag_counts else 0} "
-                    f"spread_ok={diag_counts['spread_ok'] if diag_counts else 0} "
-                    f"oi_ok={diag_counts['oi_ok'] if diag_counts else 0} "
+                    f"puts_total={diag_to_log['puts_total']} "
+                    f"delta_present={diag_to_log['delta_present']} "
+                    f"in_delta={diag_to_log['in_delta']} "
+                    f"bid_ok={diag_to_log['bid_ok']} "
+                    f"spread_ok={diag_to_log['spread_ok']} "
+                    f"oi_ok={diag_to_log['oi_ok']} "
                     f"fallback_attempted={fallback_attempted}"
                 )
-                if diag_counts and diag_counts["delta_present"] == 0:
+                
+                if diag_to_log["delta_present"] == 0:
                     log_msg += " (delta missing from Schwab)"
                 else:
                     log_msg += f" | reason={skip_reason}"
+                
+                # If fallback was attempted, include fallback diagnostics
+                if fallback_attempted:
+                    log_msg += (
+                        f" | fallback: puts_total={diag_fallback['puts_total']} "
+                        f"in_delta={diag_fallback['in_delta']} spread_ok={diag_fallback['spread_ok']} "
+                        f"reason={diag_fallback.get('reason', 'unknown')}"
+                    )
                 
                 logger.warning(log_msg)
                 continue
