@@ -971,11 +971,11 @@ def main() -> None:
             # Build metadata object as specified
             metadata = {
                 "contract_score": contract_score,
+                "total_score": total_score,  # Total score (contract_score + liquidity_bonus)
                 "score_components": {
-                    "annualized_yield": ann_yld,
+                    "annualized_yield": ann_yld,  # yield
                     "spread_pct": spread_pct,
-                    "spread_abs": spread_abs,
-                    "open_interest": oi,
+                    "open_interest": oi,  # oi
                     "delta_abs": abs_delta,
                     "dte": dte,
                 },
@@ -985,8 +985,8 @@ def main() -> None:
                     "oi_ok": oi_ok,
                 },
                 "used_dte_window": window_used,
-                "chosen_contract_score": contract_score,
-                "chosen_total_score": total_score,
+                "chosen_contract_score": contract_score,  # Alias for backward compatibility
+                "chosen_total_score": total_score,  # Alias for backward compatibility
                 "chosen_liquidity_bonus": liquidity_bonus,
                 "abs_cap_used": abs_cap_used,  # Store the tiered absolute spread cap that was applied
             }
