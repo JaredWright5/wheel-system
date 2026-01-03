@@ -158,15 +158,15 @@ def _fetch_portfolio_budget_from_schwab() -> Tuple[float, str]:
         ]
         
         # Cash/buying power field names in priority order
+        # For CSPs, prioritize true cash capacity; buyingPower may include margin
         cash_field_names = [
-            "optionBuyingPower",
-            "availableFundsForTrading",
             "cashAvailableForTrading",
-            "buyingPower",
+            "availableFundsForTrading",
             "availableFunds",
             "cashBalance",
             "totalCash",
-            "moneyMarketFund",
+            "optionBuyingPower",
+            "buyingPower",
         ]
         
         # Try each balance bucket
