@@ -185,10 +185,7 @@ def fetch_earnings_calendar_range(
         logger.info(f"FMP earnings calendar returned {total_rows} earnings events")
         
         # Build canonical universe symbol set for matching
-        canonical_universe: Dict[str, str] = {}  # canonical -> original
-        for sym in universe_symbols:
-            canonical = normalize_equity_symbol(sym)
-            canonical_universe[canonical] = sym
+        universe_canon = {normalize_equity_symbol(s) for s in universe_symbols}
         
         # Parse earnings rows
         for item in earnings_cal:
@@ -196,14 +193,14 @@ def fetch_earnings_calendar_range(
                 continue
             
             # Extract symbol (try multiple field names)
-            fmp_symbol = (
+            row_symbol = (
                 item.get("symbol") or
                 item.get("Symbol") or
                 item.get("ticker") or
                 item.get("Ticker") or
                 None
             )
-            if not fmp_symbol:
+            if not row_symbol:
                 continue
             
             # Extract earnings date (try multiple field names)
@@ -235,33 +232,42 @@ def fetch_earnings_calendar_range(
             if earnings_date < now:
                 continue
             
-            # Convert FMP symbol to canonical universe format
-            canonical_symbol = to_universe_symbol(fmp_symbol)
+            # Convert provider symbol to canonical universe format
+            event_sym = to_universe_symbol(row_symbol)
+            event_sym = normalize_equity_symbol(event_sym)
             
-            # Skip if canonical symbol not in universe
-            if canonical_symbol not in canonical_universe:
+            # Only map if event_sym is in canonical universe
+            if event_sym not in universe_canon:
                 continue
             
-            # Get original universe symbol for mapping
-            universe_symbol = canonical_universe[canonical_symbol]
+            # Find original universe symbol (build reverse mapping: canonical -> original)
+            canonical_to_original: Dict[str, str] = {}
+            for orig_sym in universe_symbols:
+                canon_sym = normalize_equity_symbol(orig_sym)
+                canonical_to_original[canon_sym] = orig_sym
+            
+            universe_symbol = canonical_to_original.get(event_sym)
+            if not universe_symbol:
+                continue
             
             # Store earliest earnings date per universe symbol
             if universe_symbol not in earnings_map or earnings_date < earnings_map[universe_symbol]:
                 earnings_map[universe_symbol] = earnings_date
         
-        mapped_symbols_count = len(earnings_map)
-        logger.info(f"Earnings calendar mapped to {mapped_symbols_count} unique symbols from universe")
+        mapped_count = len(earnings_map)
+        logger.info(f"Earnings calendar mapped to {mapped_count} unique symbols from universe")
         
-        # Log sample of unmapped universe symbols (up to 10)
+        # Log sample of unmapped universe symbols (up to 15)
         unmapped_symbols = []
         for sym in universe_symbols:
             if sym not in earnings_map:
                 unmapped_symbols.append(sym)
-                if len(unmapped_symbols) >= 10:
+                if len(unmapped_symbols) >= 15:
                     break
         
         if unmapped_symbols:
-            logger.info(f"Sample of unmapped universe symbols (showing up to 10 of {len([s for s in universe_symbols if s not in earnings_map])} total): {unmapped_symbols}")
+            total_unmapped = len([s for s in universe_symbols if s not in earnings_map])
+            logger.info(f"Sample of unmapped universe symbols (showing up to 15 of {total_unmapped} total): {unmapped_symbols}")
         
     except Exception as e:
         # Check if it's a 4xx error (402, 403, etc. - subscription/permission issues)
