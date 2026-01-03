@@ -160,6 +160,10 @@ class WheelRules:
             raise ValueError("MIN_BID cannot be negative")
         if self.MIN_CREDIT < 0:
             raise ValueError("MIN_CREDIT cannot be negative")
+        if self.MIN_UNDERLYING_PRICE < 0:
+            raise ValueError("MIN_UNDERLYING_PRICE cannot be negative")
+        if self.MAX_CSP_NOTIONAL < 0:
+            raise ValueError("MAX_CSP_NOTIONAL cannot be negative")
         if self.MAX_ABS_SPREAD_LOW_PREMIUM < 0:
             raise ValueError("MAX_ABS_SPREAD_LOW_PREMIUM cannot be negative")
         if self.MAX_ABS_SPREAD_HIGH_PREMIUM < 0:
@@ -370,6 +374,7 @@ if __name__ == "__main__":
     logger.info(f"  Allow Fallback DTE: {rules.allow_fallback_dte}")
     logger.info(f"  Liquidity: max_spread_pct={rules.max_spread_pct}%, min_oi={rules.min_open_interest}, min_bid=${rules.min_bid:.2f}, min_credit=${rules.min_credit:.2f}")
     logger.info(f"  Liquidity: max_abs_spread_low=${rules.max_abs_spread_low_premium:.2f}, max_abs_spread_high=${rules.max_abs_spread_high_premium:.2f}")
+    logger.info(f"  Safety rails: min_underlying_price=${rules.min_underlying_price:.2f}, max_csp_notional=${rules.max_csp_notional:,.0f}")
 
     # Test is_within_dte_window
     today = datetime.now(timezone.utc).date()
