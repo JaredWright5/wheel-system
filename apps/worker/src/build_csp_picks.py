@@ -42,6 +42,7 @@ MAX_ANNUALIZED_YIELD = float(os.getenv("MAX_ANNUALIZED_YIELD", "3.0"))
 # Portfolio budget and selection parameters
 WHEEL_CSP_MAX_TRADES = int(os.getenv("WHEEL_CSP_MAX_TRADES", "4"))
 WHEEL_CSP_MIN_CASH_BUFFER_PCT = float(os.getenv("WHEEL_CSP_MIN_CASH_BUFFER_PCT", "0.10"))
+WHEEL_CSP_MAX_CASH_PER_TRADE = float(os.getenv("WHEEL_CSP_MAX_CASH_PER_TRADE", "25000.0"))
 DEFAULT_PORTFOLIO_CASH = 50000.0  # Fallback if Schwab fetch fails
 
 
@@ -1305,6 +1306,7 @@ def main() -> None:
     selected_indices = set()
     running_allocated_net = 0.0
     selection_rank = 0
+    skipped_portfolio_trade_too_large = 0
     
     for idx, total_score, required_cash_net in picks_with_scores:
         # Check if we've hit max trades limit
@@ -1315,8 +1317,13 @@ def main() -> None:
         pick_metadata = pick_rows[idx].get("pick_metrics", {}).get("metadata", {})
         required_cash = pick_metadata.get("required_cash", 0.0)
         
-        # Check if this pick fits within remaining allocatable cash
-        if running_allocated_net + required_cash_net <= allocatable_cash:
+        # Check if trade size exceeds max cash per trade limit
+        skipped_due_to_trade_size = required_cash_net > WHEEL_CSP_MAX_CASH_PER_TRADE
+        if skipped_due_to_trade_size:
+            skipped_portfolio_trade_too_large += 1
+        
+        # Check if this pick fits within remaining allocatable cash and trade size limit
+        if not skipped_due_to_trade_size and running_allocated_net + required_cash_net <= allocatable_cash:
             selected_indices.add(idx)
             running_allocated_net += required_cash_net
             selection_rank += 1
@@ -1328,6 +1335,8 @@ def main() -> None:
                 "allocatable_cash": allocatable_cash,
                 "required_cash": required_cash,
                 "required_cash_net": required_cash_net,
+                "max_cash_per_trade": WHEEL_CSP_MAX_CASH_PER_TRADE,
+                "skipped_due_to_trade_size": skipped_due_to_trade_size,
                 "selected": True,
                 "selection_rank": selection_rank,
                 "running_allocated_net": running_allocated_net,
@@ -1341,6 +1350,8 @@ def main() -> None:
                 "allocatable_cash": allocatable_cash,
                 "required_cash": required_cash,
                 "required_cash_net": required_cash_net,
+                "max_cash_per_trade": WHEEL_CSP_MAX_CASH_PER_TRADE,
+                "skipped_due_to_trade_size": skipped_due_to_trade_size,
                 "selected": False,
                 "selection_rank": None,
                 "running_allocated_net": None,
@@ -1351,7 +1362,8 @@ def main() -> None:
     logger.info(
         f"Portfolio selection: {selected_count}/{len(pick_rows)} picks selected, "
         f"allocated=${running_allocated_net:,.2f} / ${allocatable_cash:,.2f} allocatable "
-        f"(${portfolio_budget_cash:,.2f} budget with {cash_buffer_pct:.1%} buffer)"
+        f"(${portfolio_budget_cash:,.2f} budget with {cash_buffer_pct:.1%} buffer), "
+        f"skipped_trade_too_large={skipped_portfolio_trade_too_large}"
     )
 
     # 3) Delete existing CSP picks for this run_id, then insert new ones
