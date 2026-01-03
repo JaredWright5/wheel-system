@@ -572,7 +572,7 @@ def main() -> None:
                 continue
 
             # Try primary window first
-            best, exp, diag_primary = attempt_window(
+            best_primary, exp_primary, diag_primary = attempt_window(
                 window_name="primary",
                 min_dte=rules.dte_min_primary,
                 max_dte=rules.dte_max_primary,
@@ -584,12 +584,64 @@ def main() -> None:
             
             window_used = None
             fallback_attempted = False
+            best = best_primary
+            exp = exp_primary
             
-            if best:
-                # Success in primary window
+            # If primary succeeded and fallback is allowed, also try fallback to compare
+            if best_primary and rules.allow_fallback_dte:
+                fallback_attempted = True
+                logger.info(f"{ticker}: primary succeeded, trying fallback for comparison")
+                
+                # Try fallback window
+                best_fallback, exp_fallback, diag_fallback = attempt_window(
+                    window_name="fallback",
+                    min_dte=rules.dte_min_fallback,
+                    max_dte=rules.dte_max_fallback,
+                    chain=chain,
+                    expirations=expirations,
+                    rules=rules,
+                    now=now,
+                )
+                
+                if best_fallback:
+                    # Both windows succeeded - compare using total_score
+                    # Calculate total_score for primary
+                    spread_pct_primary = _safe_float(best_primary.get("_spread_pct"), 0.0) or 0.0
+                    liquidity_bonus_primary = max(0.0, (0.05 - spread_pct_primary) * 100.0)
+                    contract_score_primary = _safe_float(best_primary.get("_contract_score"), 0.0) or 0.0
+                    total_score_primary = contract_score_primary + liquidity_bonus_primary
+                    
+                    # Calculate total_score for fallback
+                    spread_pct_fallback = _safe_float(best_fallback.get("_spread_pct"), 0.0) or 0.0
+                    liquidity_bonus_fallback = max(0.0, (0.05 - spread_pct_fallback) * 100.0)
+                    contract_score_fallback = _safe_float(best_fallback.get("_contract_score"), 0.0) or 0.0
+                    total_score_fallback = contract_score_fallback + liquidity_bonus_fallback
+                    
+                    # Choose the one with higher total_score
+                    if total_score_fallback > total_score_primary:
+                        best = best_fallback
+                        exp = exp_fallback
+                        window_used = "fallback"
+                        logger.info(
+                            f"{ticker}: fallback selected | "
+                            f"primary_score={total_score_primary:.4f} (contract={contract_score_primary:.4f} + bonus={liquidity_bonus_primary:.4f}) | "
+                            f"fallback_score={total_score_fallback:.4f} (contract={contract_score_fallback:.4f} + bonus={liquidity_bonus_fallback:.4f})"
+                        )
+                    else:
+                        window_used = "primary"
+                        logger.info(
+                            f"{ticker}: primary selected | "
+                            f"primary_score={total_score_primary:.4f} (contract={contract_score_primary:.4f} + bonus={liquidity_bonus_primary:.4f}) | "
+                            f"fallback_score={total_score_fallback:.4f} (contract={contract_score_fallback:.4f} + bonus={liquidity_bonus_fallback:.4f})"
+                        )
+                else:
+                    # Primary succeeded, fallback failed - use primary
+                    window_used = "primary"
+            elif best_primary:
+                # Primary succeeded, fallback not allowed or not attempted
                 window_used = "primary"
             else:
-                # No pick in primary - check if we should try fallback
+                # Primary failed - check if we should try fallback
                 should_try_fallback = (
                     rules.allow_fallback_dte and
                     (diag_primary["in_delta"] == 0 or 
@@ -598,7 +650,7 @@ def main() -> None:
                 
                 if should_try_fallback:
                     fallback_attempted = True
-                    logger.info(f"{ticker}: attempting fallback due to primary liquidity failure")
+                    logger.info(f"{ticker}: attempting fallback due to primary failure")
                     
                     # Try fallback window
                     best_fallback, exp_fallback, diag_fallback = attempt_window(
@@ -684,6 +736,10 @@ def main() -> None:
             contract_score = _safe_float(best.get("_contract_score"))
             oi = _safe_float(best.get("openInterest"), 0.0) or 0.0
 
+            # Calculate liquidity bonus and total_score
+            liquidity_bonus = max(0.0, (0.05 - spread_pct) * 100.0)
+            total_score = contract_score + liquidity_bonus
+
             # Check liquidity pass status for metadata
             min_bid_ok = bid >= rules.min_bid
             spread_ok_status = False
@@ -702,7 +758,8 @@ def main() -> None:
                 f"{ticker}: pick created | window={window_used} | "
                 f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
                 f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
-                f"score={contract_score:.4f} | spread_pct={spread_pct:.2f}% | oi={oi:.0f}"
+                f"contract_score={contract_score:.4f} | total_score={total_score:.4f} | "
+                f"spread_pct={spread_pct:.2f}% | oi={oi:.0f}"
             )
 
             # Get RSI period/interval from candidate metrics or use defaults
@@ -754,6 +811,8 @@ def main() -> None:
                         "spread_pct": spread_pct,
                         "annualized_yield": ann_yld,
                         "contract_score": contract_score,
+                        "total_score": total_score,
+                        "liquidity_bonus": liquidity_bonus,
                         "openInterest": best.get("openInterest"),
                         "volume": best.get("totalVolume") or best.get("volume"),
                         "inTheMoney": best.get("inTheMoney"),
