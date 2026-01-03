@@ -312,14 +312,23 @@ def _choose_best_put_in_delta_band(
         if not (target_delta_low <= abs_delta <= target_delta_high):
             continue
 
-        # Check liquidity
+        # Check liquidity (this also validates bid/ask and returns spread_details)
         is_liquid, liquidity_reason, spread_details = _check_liquidity(o, rules)
         if not is_liquid:
             continue  # Skip but don't log here (too verbose)
-
-        # Premium estimate (prefer mark, fallback to mid, then last)
+        
+        # Extract bid/ask for premium calculation
         bid = _safe_float(o.get("bid"), 0.0) or 0.0
         ask = _safe_float(o.get("ask"), 0.0) or 0.0
+        
+        # Use spread_details as single source of truth for spread values
+        if not spread_details or spread_details.get("mid") is None:
+            continue  # Invalid spread_details
+        mid = spread_details["mid"]
+        spread_abs = spread_details["spread_abs"]
+        spread_pct = spread_details["spread_pct"]
+
+        # Premium estimate (prefer mark, fallback to mid, then last)
         mark = _safe_float(o.get("mark"))
         last = _safe_float(o.get("last"))
 
@@ -329,16 +338,6 @@ def _choose_best_put_in_delta_band(
             mark = last if last is not None else None
         if mark is None or mark <= 0:
             continue
-
-        # Quote sanity checks
-        if ask < bid:
-            continue  # Invalid: ask < bid
-        mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else mark
-        if mid <= 0:
-            continue  # Invalid: mid must be > 0
-        abs_spread = ask - bid
-        if abs_spread <= 0:
-            continue  # Invalid: spread must be > 0
 
         strike = _safe_float(o.get("strike"))
         if strike is None or strike <= 0:
@@ -351,9 +350,6 @@ def _choose_best_put_in_delta_band(
         # Yield sanity check
         if annualized_yield > MAX_ANNUALIZED_YIELD:
             continue  # Reject contracts with unrealistic yields
-
-        # Calculate spread percentage
-        spread_pct = (abs_spread / mid) * 100.0 if mid > 0 else 0.0
 
         # Get open interest for scoring
         oi = _safe_float(o.get("openInterest"), 0.0) or 0.0
@@ -431,25 +427,22 @@ def _find_best_in_delta_contract(puts: List[Dict[str, Any]], target_delta_low: f
         if not (target_delta_low <= abs_delta <= target_delta_high):
             continue
         
-        # Get bid/ask for spread calculation
+        # Get bid/ask for spread evaluation
         bid = _safe_float(o.get("bid"), 0.0) or 0.0
         ask = _safe_float(o.get("ask"), 0.0) or 0.0
         if bid <= 0 or ask <= 0 or ask < bid:
             continue
         
-        mid = (bid + ask) / 2.0
-        if mid <= 0:
-            continue
-        
-        abs_spread = ask - bid
-        if abs_spread <= 0:
-            continue
-        
-        spread_pct = (abs_spread / mid) * 100.0 if mid > 0 else float('inf')
-        
-        # Get spread_details to include abs_cap_used
+        # Use spread_ok() as single source of truth for spread values
         _, spread_details = spread_ok(bid=bid, ask=ask, rules=rules)
-        abs_cap_used = spread_details.get("abs_cap_used") if spread_details else None
+        if not spread_details or spread_details.get("mid") is None:
+            continue  # Invalid spread_details
+        
+        # Extract spread values from spread_details
+        mid = spread_details["mid"]
+        spread_abs = spread_details["spread_abs"]
+        spread_pct = spread_details["spread_pct"]
+        abs_cap_used = spread_details.get("abs_cap_used")
         
         # Track the contract with tightest spread
         if spread_pct < best_spread_pct:
@@ -457,7 +450,7 @@ def _find_best_in_delta_contract(puts: List[Dict[str, Any]], target_delta_low: f
             strike = _safe_float(o.get("strike"))
             best_in_delta = {
                 "spread_pct": spread_pct,
-                "spread_abs": abs_spread,
+                "spread_abs": spread_abs,
                 "bid": bid,
                 "ask": ask,
                 "strike": strike,
@@ -922,11 +915,31 @@ def main() -> None:
             ask = _safe_float(best.get("ask"), 0.0) or 0.0
             dte = (exp - now).days
             ann_yld = _safe_float(best.get("_annualized_yield"))
-            mid = _safe_float(best.get("_mid")) or ((bid + ask) / 2.0 if (bid > 0 and ask > 0) else premium)
-            spread_abs = _safe_float(best.get("_spread_abs")) or (ask - bid if (ask > bid) else 0.0)
-            spread_pct = _safe_float(best.get("_spread_pct")) or ((spread_abs / mid) * 100.0 if mid > 0 else 0.0)
             contract_score = _safe_float(best.get("_contract_score"))
             oi = _safe_float(best.get("openInterest"), 0.0) or 0.0
+
+            # Use spread_ok() as single source of truth for spread values
+            min_bid_ok = bid >= rules.min_bid
+            spread_ok_status = False
+            spread_details_for_metadata = None
+            if min_bid_ok and ask > 0:
+                spread_ok_status, spread_details_for_metadata = spread_ok(bid=bid, ask=ask, rules=rules)
+            
+            # Extract spread values from spread_details (single source of truth)
+            if spread_details_for_metadata and spread_details_for_metadata.get("mid") is not None:
+                mid = spread_details_for_metadata["mid"]
+                spread_abs = spread_details_for_metadata["spread_abs"]
+                spread_pct = spread_details_for_metadata["spread_pct"]
+                abs_cap_used = spread_details_for_metadata.get("abs_cap_used")
+            else:
+                # Fallback if spread_ok didn't return valid details (shouldn't happen for valid contracts)
+                mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else premium
+                spread_abs = ask - bid if (ask > bid) else 0.0
+                spread_pct = (spread_abs / mid) * 100.0 if mid > 0 else 0.0
+                abs_cap_used = None
+                logger.warning(f"{ticker}: spread_details missing, using fallback calculation")
+
+            oi_ok = oi >= rules.min_open_interest
 
             # Ensure contract_score exists (should always be present from _choose_best_put_in_delta_band)
             if contract_score is None:
@@ -941,25 +954,6 @@ def main() -> None:
             # Calculate liquidity bonus and total_score (for comparison logging only)
             liquidity_bonus = max(0.0, (0.05 - spread_pct) * 100.0)
             total_score = contract_score + liquidity_bonus
-
-            # Check liquidity pass status for metadata using new spread_ok signature
-            min_bid_ok = bid >= rules.min_bid
-            spread_ok_status = False
-            spread_details_for_metadata = None
-            if min_bid_ok and ask > 0:
-                spread_ok_status, spread_details_for_metadata = spread_ok(bid=bid, ask=ask, rules=rules)
-            oi_ok = oi >= rules.min_open_interest
-            
-            # Ensure spread_details match what we computed (use from spread_ok if available, otherwise compute)
-            if spread_details_for_metadata:
-                # Use values from spread_ok for consistency
-                mid = spread_details_for_metadata.get("mid", mid)
-                spread_abs = spread_details_for_metadata.get("spread_abs", spread_abs)
-                spread_pct = spread_details_for_metadata.get("spread_pct", spread_pct)
-                abs_cap_used = spread_details_for_metadata.get("abs_cap_used")
-            else:
-                # Fallback to computed values if spread_ok didn't return details
-                abs_cap_used = None
 
             # Log successful pick with contract_score
             logger.info(
