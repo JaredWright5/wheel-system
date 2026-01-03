@@ -477,6 +477,9 @@ class FMPStableClient:
         """
         Get RSI technical indicator.
         
+        Calls: GET /stable/technical-indicators/rsi
+        Params: symbol=<normalized>, periodLength=<int>, timeframe=<string like "1day">
+        
         Robustly handles multiple response formats:
         - {"rsi": 53.2}
         - [{"rsi": 53.2, "date": "..."}]
@@ -484,8 +487,8 @@ class FMPStableClient:
         
         Args:
             symbol: Stock symbol
-            period: RSI period (default 14)
-            interval: Data interval (default "1day")
+            period: RSI period (default 14) -> maps to periodLength
+            interval: Data interval (default "1day") -> maps to timeframe
             limit: Number of data points (default 1 for latest)
             
         Returns:
@@ -506,8 +509,8 @@ class FMPStableClient:
         
         Args:
             symbol: Stock symbol
-            period: RSI period (default 14)
-            interval: Data interval (default "1day")
+            period: RSI period (default 14) -> maps to periodLength
+            interval: Data interval (default "1day") -> maps to timeframe
             limit: Number of data points (default 1 for latest)
             
         Returns:
@@ -554,15 +557,37 @@ class FMPStableClient:
             
             # Format 2: [{"rsi": 53.2, "date": "..."}, ...] or [{"value": 53.2, ...}, ...]
             if isinstance(data, list) and data:
-                # Get most recent (first item if sorted by date desc)
-                latest = data[0]
-                if isinstance(latest, dict):
-                    rsi = latest.get("rsi") or latest.get("RSI") or latest.get("value")
-                    if rsi is not None:
+                # If list has "date" field, find most recent; otherwise take first element
+                if len(data) > 0:
+                    # Check if any element has "date" field
+                    has_dates = any(isinstance(item, dict) and "date" in item for item in data)
+                    
+                    if has_dates:
+                        # Sort by date descending and take most recent
                         try:
-                            return float(rsi), meta
-                        except (ValueError, TypeError):
-                            pass
+                            sorted_data = sorted(
+                                [item for item in data if isinstance(item, dict) and "date" in item],
+                                key=lambda x: x.get("date", ""),
+                                reverse=True
+                            )
+                            if sorted_data:
+                                latest = sorted_data[0]
+                            else:
+                                latest = data[0]
+                        except Exception:
+                            # Fallback to first element if sorting fails
+                            latest = data[0]
+                    else:
+                        # No dates, take first element
+                        latest = data[0]
+                    
+                    if isinstance(latest, dict):
+                        rsi = latest.get("rsi") or latest.get("RSI") or latest.get("value")
+                        if rsi is not None:
+                            try:
+                                return float(rsi), meta
+                            except (ValueError, TypeError):
+                                pass
             
             # Data exists but couldn't parse RSI value
             return None, {"ok": False, "status": meta.get("status"), "error_type": "parse_error"}
@@ -609,32 +634,27 @@ class FMPStableClient:
     def financial_statement_growth(
         self,
         symbol: str,
-        period: str = "annual",
         limit: int = 5
     ) -> List[Dict[str, Any]]:
         """
         Get financial statement growth data for a symbol.
         
-        Tries multiple param patterns in order (first that returns non-empty):
-        1) {"symbol": sym, "period": period, "limit": limit}
-        2) {"symbol": sym, "limit": limit}
-        3) {"symbol": sym}
+        Calls: GET /stable/financial-growth
+        Params: symbol=<normalized>
         
         Args:
             symbol: Stock symbol (e.g., "AAPL")
-            period: Period type ("annual" or "quarter")
             limit: Maximum number of periods to return (default 5)
             
         Returns:
             List of growth records (most recent first), or [] if not found or on error
         """
-        growth_data, _ = self.financial_statement_growth_with_meta(symbol, period, limit)
+        growth_data, _ = self.financial_statement_growth_with_meta(symbol, limit)
         return growth_data
 
     def financial_statement_growth_with_meta(
         self,
         symbol: str,
-        period: str = "annual",
         limit: int = 5
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
@@ -642,7 +662,6 @@ class FMPStableClient:
         
         Args:
             symbol: Stock symbol (e.g., "AAPL")
-            period: Period type ("annual" or "quarter")
             limit: Maximum number of periods to return (default 5)
             
         Returns:
@@ -653,32 +672,23 @@ class FMPStableClient:
         original_symbol = symbol
         normalized_symbol = _normalize_symbol_for_fmp(symbol)
         
-        # Try param patterns in order
-        param_patterns = [
-            {"symbol": normalized_symbol, "period": period, "limit": limit},
-            {"symbol": normalized_symbol, "limit": limit},
-            {"symbol": normalized_symbol},
-        ]
+        # Use correct endpoint: /stable/financial-growth (not financial-statement-growth)
+        params = {"symbol": normalized_symbol}
+        data, meta = self._get_json("financial-growth", params, "financial-growth", original_symbol)
         
-        last_meta = {"ok": False, "status": None, "error_type": "empty"}
+        if data is None:
+            return [], meta
         
-        for params in param_patterns:
-            data, meta = self._get_json("financial-statement-growth", params, "financial-statement-growth", original_symbol)
-            last_meta = meta
-            
-            if data is not None:
-                # Normalize to list
-                if isinstance(data, list):
-                    # Return most recent records (limit to <= 5 to avoid large payloads)
-                    result = data[:min(limit, 5)]
-                    if result:  # Only return if non-empty
-                        return result, meta
-                elif isinstance(data, dict):
-                    # Single record as dict -> convert to list
-                    return [data], meta
+        # Normalize to list
+        if isinstance(data, list):
+            # Return most recent records (limit to <= limit)
+            result = data[:limit]
+            return result, meta
+        elif isinstance(data, dict):
+            # Single record as dict -> convert to list
+            return [data], meta
         
-        # All patterns failed or returned empty
-        return [], last_meta
+        return [], meta
 
 
 def simple_sentiment_score(news_items: List[Dict[str, Any]]) -> float:

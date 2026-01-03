@@ -833,7 +833,7 @@ def main() -> None:
                 
                 # Fetch new fundamental datasets with diagnostics
                 financial_scores_data = fmp.financial_scores(t) or {}
-                financial_growth_data, growth_meta = fmp.financial_statement_growth_with_meta(t, period="annual", limit=5)
+                financial_growth_data, growth_meta = fmp.financial_statement_growth_with_meta(t, limit=5)
                 
                 # Track missing datasets and error types
                 if not financial_scores_data:
@@ -855,8 +855,7 @@ def main() -> None:
                 rsi_value, rsi_meta = fmp.technical_indicator_rsi_with_meta(
                     t,
                     period=rules.rsi_period,
-                    interval=rules.rsi_interval,
-                    limit=1
+                    interval=rules.rsi_interval
                 )
                 
                 # Fallback to Supabase cache if FMP failed
