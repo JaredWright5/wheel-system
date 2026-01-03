@@ -956,11 +956,16 @@ def main() -> None:
             liquidity_bonus = max(0.0, (0.05 - spread_pct) * 100.0)
             total_score = contract_score + liquidity_bonus
 
+            # Calculate required cash for CSP
+            required_cash = strike * 100.0  # Full assignment value
+            required_cash_net = required_cash - (bid * 100.0)  # Net cash after premium received
+
             # Log successful pick with contract_score
             logger.info(
                 f"{ticker}: pick created | window={window_used} | "
                 f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
-                f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | score={contract_score:.4f}"
+                f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | score={contract_score:.4f} | "
+                f"required_cash_net=${required_cash_net:,.2f}"
             )
 
             # Get RSI period/interval from candidate metrics or use defaults
@@ -989,6 +994,8 @@ def main() -> None:
                 "chosen_total_score": total_score,  # Alias for backward compatibility
                 "chosen_liquidity_bonus": liquidity_bonus,
                 "abs_cap_used": abs_cap_used,  # Store the tiered absolute spread cap that was applied
+                "required_cash": required_cash,  # Full assignment value (strike * 100)
+                "required_cash_net": required_cash_net,  # Net cash after premium received
             }
             
             # Add comparison data if available
