@@ -682,12 +682,27 @@ def main() -> None:
             spread_abs = _safe_float(best.get("_spread_abs")) or (ask - bid if (ask > bid) else 0.0)
             spread_pct = _safe_float(best.get("_spread_pct")) or ((spread_abs / mid) * 100.0 if mid > 0 else 0.0)
             contract_score = _safe_float(best.get("_contract_score"))
+            oi = _safe_float(best.get("openInterest"), 0.0) or 0.0
 
-            # Log successful pick with window used
+            # Check liquidity pass status for metadata
+            min_bid_ok = bid >= rules.min_bid
+            spread_ok_status = False
+            if min_bid_ok and ask > 0:
+                spread_ok_status = spread_ok(
+                    bid=bid,
+                    ask=ask,
+                    max_spread_pct=rules.max_spread_pct,
+                    max_abs_low=rules.max_abs_spread_low_premium,
+                    max_abs_high=rules.max_abs_spread_high_premium,
+                )
+            oi_ok = oi >= rules.min_open_interest
+
+            # Log successful pick with window used and scoring details
             logger.info(
                 f"{ticker}: pick created | window={window_used} | "
                 f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
-                f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%}"
+                f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
+                f"score={contract_score:.4f} | spread_pct={spread_pct:.2f}% | oi={oi:.0f}"
             )
 
             # Get RSI period/interval from candidate metrics or use defaults
@@ -745,6 +760,19 @@ def main() -> None:
                         "symbol": best.get("symbol"),
                         "abs_delta": abs_delta,
                         "dte": dte,
+                    },
+                    "score_components": {
+                        "annualized_yield": ann_yld,
+                        "spread_pct": spread_pct,
+                        "spread_abs": spread_abs,
+                        "open_interest": oi,
+                        "delta_abs": abs_delta,
+                        "dte": dte,
+                    },
+                    "liquidity_pass": {
+                        "min_bid": min_bid_ok,
+                        "spread_ok": spread_ok_status,
+                        "oi_ok": oi_ok,
                     },
                 },
             })
