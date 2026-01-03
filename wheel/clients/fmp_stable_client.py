@@ -78,6 +78,87 @@ class FMPStableClient:
         """
         self._blocked.add((endpoint, normalized_symbol))
 
+    def _get_json(
+        self,
+        endpoint: str,
+        params: Dict[str, Any],
+        endpoint_name: str,
+        symbol_original: str,
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """
+        Generic helper to fetch JSON from FMP API with diagnostics.
+        
+        Args:
+            endpoint: Endpoint path (e.g., "quote", "financial-scores")
+            params: Query parameters (apikey will be added automatically)
+            endpoint_name: Endpoint name for logging/blocking (e.g., "quote")
+            symbol_original: Original symbol for logging
+            
+        Returns:
+            Tuple of (data, meta) where:
+            - data: Parsed JSON response (or None if error)
+            - meta: Dict with {"ok": bool, "status": int|None, "error_type": str}
+              error_type in {"blocked_402", "http_error", "empty", "parse_error", "ok"}
+        """
+        normalized_symbol = _normalize_symbol_for_fmp(symbol_original)
+        
+        # Check blocked cache
+        if self._is_blocked(endpoint_name, normalized_symbol):
+            logger.debug(f"FMP {endpoint_name}({symbol_original} -> {normalized_symbol}): skipping (402-blocked)")
+            return None, {"ok": False, "status": None, "error_type": "blocked_402"}
+        
+        # Prepare request
+        request_params = params.copy()
+        request_params["apikey"] = self.api_key
+        url = f"{BASE_URL}/{endpoint.lstrip('/')}"
+        
+        try:
+            response = requests.get(url, params=request_params, timeout=self.timeout)
+            status_code = response.status_code
+            
+            # Handle 402 Payment Required
+            if status_code == 402:
+                self._mark_blocked(endpoint_name, normalized_symbol)
+                logger.warning(
+                    f"FMP {endpoint_name}({symbol_original} -> {normalized_symbol}): "
+                    f"402 Payment Required (subscription tier) - blocking future calls"
+                )
+                return None, {"ok": False, "status": 402, "error_type": "blocked_402"}
+            
+            # Handle 404
+            if status_code == 404:
+                return None, {"ok": False, "status": 404, "error_type": "empty"}
+            
+            # Raise for other HTTP errors
+            response.raise_for_status()
+            
+            # Parse JSON
+            try:
+                data = response.json()
+                # Check if response is empty
+                if data is None or (isinstance(data, list) and len(data) == 0) or (isinstance(data, dict) and len(data) == 0):
+                    return None, {"ok": False, "status": status_code, "error_type": "empty"}
+                return data, {"ok": True, "status": status_code, "error_type": "ok"}
+            except (ValueError, TypeError) as parse_err:
+                logger.warning(f"FMP {endpoint_name}({symbol_original} -> {normalized_symbol}): JSON parse error: {parse_err}")
+                return None, {"ok": False, "status": status_code, "error_type": "parse_error"}
+                
+        except requests.HTTPError as e:
+            status_code = e.response.status_code if hasattr(e, 'response') and e.response else None
+            # Handle 402 in exception path
+            if status_code == 402:
+                self._mark_blocked(endpoint_name, normalized_symbol)
+                logger.warning(
+                    f"FMP {endpoint_name}({symbol_original} -> {normalized_symbol}): "
+                    f"402 Payment Required (subscription tier) - blocking future calls"
+                )
+                return None, {"ok": False, "status": 402, "error_type": "blocked_402"}
+            logger.warning(f"FMP {endpoint_name}({symbol_original} -> {normalized_symbol}): HTTP error {status_code}: {e}")
+            return None, {"ok": False, "status": status_code, "error_type": "http_error"}
+        except Exception as e:
+            logger.warning(f"FMP {endpoint_name}({symbol_original} -> {normalized_symbol}): unexpected error: {e}")
+            return None, {"ok": False, "status": None, "error_type": "http_error"}
+
     def _get(
         self,
         endpoint: str,
@@ -86,7 +167,7 @@ class FMPStableClient:
         normalized_symbol: Optional[str] = None,
     ) -> Any:
         """
-        Make GET request to FMP stable API.
+        Make GET request to FMP stable API (legacy method, use _get_json for new code).
         
         Args:
             endpoint: Endpoint path (e.g., "profile" or "company-screener")
@@ -396,6 +477,11 @@ class FMPStableClient:
         """
         Get RSI technical indicator.
         
+        Robustly handles multiple response formats:
+        - {"rsi": 53.2}
+        - [{"rsi": 53.2, "date": "..."}]
+        - [{"value": 53.2, ...}]
+        
         Args:
             symbol: Stock symbol
             period: RSI period (default 14)
@@ -405,8 +491,33 @@ class FMPStableClient:
         Returns:
             RSI value (float) if available, None otherwise
         """
+        rsi_value, _ = self.technical_indicator_rsi_with_meta(symbol, period, interval, limit)
+        return rsi_value
+
+    def technical_indicator_rsi_with_meta(
+        self,
+        symbol: str,
+        period: int = 14,
+        interval: str = "1day",
+        limit: int = 1
+    ) -> Tuple[Optional[float], Dict[str, Any]]:
+        """
+        Get RSI technical indicator with diagnostics metadata.
+        
+        Args:
+            symbol: Stock symbol
+            period: RSI period (default 14)
+            interval: Data interval (default "1day")
+            limit: Number of data points (default 1 for latest)
+            
+        Returns:
+            Tuple of (rsi_value, meta) where:
+            - rsi_value: RSI value (float) if available, None otherwise
+            - meta: Dict with {"ok": bool, "status": int|None, "error_type": str}
+        """
         original_symbol = symbol
         normalized_symbol = _normalize_symbol_for_fmp(symbol)
+        
         try:
             # Convert interval format: "daily" -> "1day", "weekly" -> "1week", etc.
             timeframe_map = {
@@ -425,37 +536,39 @@ class FMPStableClient:
                 "periodLength": period,
                 "timeframe": timeframe,
             }
-            data = self._get("technical-indicators/rsi", params=params, check_blocked=True, normalized_symbol=normalized_symbol)
+            
+            data, meta = self._get_json("technical-indicators/rsi", params, "rsi", original_symbol)
             
             if data is None:
-                return None
+                return None, meta
             
             # Handle various response formats
-            if isinstance(data, list) and data:
-                latest = data[0]
-                if isinstance(latest, dict):
-                    # Look for rsi field
-                    rsi = latest.get("rsi") or latest.get("RSI") or latest.get("value")
-                    if rsi is not None:
-                        try:
-                            return float(rsi)
-                        except (ValueError, TypeError):
-                            pass
+            # Format 1: {"rsi": 53.2} or {"RSI": 53.2} or {"value": 53.2}
             if isinstance(data, dict):
                 rsi = data.get("rsi") or data.get("RSI") or data.get("value")
                 if rsi is not None:
                     try:
-                        return float(rsi)
+                        return float(rsi), meta
                     except (ValueError, TypeError):
                         pass
             
-            return None
-        except requests.HTTPError as e:
-            # 404 or other errors - return None (indicator not available)
-            return None
+            # Format 2: [{"rsi": 53.2, "date": "..."}, ...] or [{"value": 53.2, ...}, ...]
+            if isinstance(data, list) and data:
+                # Get most recent (first item if sorted by date desc)
+                latest = data[0]
+                if isinstance(latest, dict):
+                    rsi = latest.get("rsi") or latest.get("RSI") or latest.get("value")
+                    if rsi is not None:
+                        try:
+                            return float(rsi), meta
+                        except (ValueError, TypeError):
+                            pass
+            
+            # Data exists but couldn't parse RSI value
+            return None, {"ok": False, "status": meta.get("status"), "error_type": "parse_error"}
         except Exception as e:
             logger.debug(f"FMP technical_indicator_rsi({original_symbol} -> {normalized_symbol}) error: {e}")
-            return None
+            return None, {"ok": False, "status": None, "error_type": "parse_error"}
 
     @retry(
         stop=stop_after_attempt(3),
@@ -474,24 +587,19 @@ class FMPStableClient:
         """
         original_symbol = symbol
         normalized_symbol = _normalize_symbol_for_fmp(symbol)
-        try:
-            data = self._get("financial-scores", params={"symbol": normalized_symbol}, check_blocked=True, normalized_symbol=normalized_symbol)
-            if data is None:
-                return {}
-            if isinstance(data, list) and data:
-                return data[0]
-            if isinstance(data, dict):
-                return data
+        
+        params = {"symbol": normalized_symbol}
+        data, meta = self._get_json("financial-scores", params, "financial-scores", original_symbol)
+        
+        if data is None:
             return {}
-        except requests.HTTPError as e:
-            # Handle 404 gracefully
-            if hasattr(e, 'response') and e.response and e.response.status_code == 404:
-                return {}
-            logger.warning(f"FMP financial_scores({original_symbol} -> {normalized_symbol}) failed: {e}")
-            return {}
-        except Exception as e:
-            logger.warning(f"FMP financial_scores({original_symbol} -> {normalized_symbol}) unexpected error: {e}")
-            return {}
+        
+        # Normalize to dict
+        if isinstance(data, list) and data:
+            return data[0]
+        if isinstance(data, dict):
+            return data
+        return {}
 
     @retry(
         stop=stop_after_attempt(3),
@@ -507,6 +615,11 @@ class FMPStableClient:
         """
         Get financial statement growth data for a symbol.
         
+        Tries multiple param patterns in order (first that returns non-empty):
+        1) {"symbol": sym, "period": period, "limit": limit}
+        2) {"symbol": sym, "limit": limit}
+        3) {"symbol": sym}
+        
         Args:
             symbol: Stock symbol (e.g., "AAPL")
             period: Period type ("annual" or "quarter")
@@ -515,34 +628,57 @@ class FMPStableClient:
         Returns:
             List of growth records (most recent first), or [] if not found or on error
         """
+        growth_data, _ = self.financial_statement_growth_with_meta(symbol, period, limit)
+        return growth_data
+
+    def financial_statement_growth_with_meta(
+        self,
+        symbol: str,
+        period: str = "annual",
+        limit: int = 5
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Get financial statement growth data with diagnostics metadata.
+        
+        Args:
+            symbol: Stock symbol (e.g., "AAPL")
+            period: Period type ("annual" or "quarter")
+            limit: Maximum number of periods to return (default 5)
+            
+        Returns:
+            Tuple of (growth_list, meta) where:
+            - growth_list: List of growth records, or [] if not found
+            - meta: Dict with {"ok": bool, "status": int|None, "error_type": str}
+        """
         original_symbol = symbol
         normalized_symbol = _normalize_symbol_for_fmp(symbol)
-        try:
-            params = {"symbol": normalized_symbol}
-            # Include period and limit if endpoint supports them
-            if period:
-                params["period"] = period
-            if limit:
-                params["limit"] = limit
+        
+        # Try param patterns in order
+        param_patterns = [
+            {"symbol": normalized_symbol, "period": period, "limit": limit},
+            {"symbol": normalized_symbol, "limit": limit},
+            {"symbol": normalized_symbol},
+        ]
+        
+        last_meta = {"ok": False, "status": None, "error_type": "empty"}
+        
+        for params in param_patterns:
+            data, meta = self._get_json("financial-statement-growth", params, "financial-statement-growth", original_symbol)
+            last_meta = meta
             
-            data = self._get("financial-statement-growth", params=params, check_blocked=True, normalized_symbol=normalized_symbol)
-            if data is None:
-                return []
-            if isinstance(data, list):
-                # Return most recent records (limit to <= 5 to avoid large payloads)
-                return data[:min(limit, 5)]
-            if isinstance(data, dict):
-                return [data]
-            return []
-        except requests.HTTPError as e:
-            # Handle 404 gracefully
-            if hasattr(e, 'response') and e.response and e.response.status_code == 404:
-                return []
-            logger.warning(f"FMP financial_statement_growth({original_symbol} -> {normalized_symbol}) failed: {e}")
-            return []
-        except Exception as e:
-            logger.warning(f"FMP financial_statement_growth({original_symbol} -> {normalized_symbol}) unexpected error: {e}")
-            return []
+            if data is not None:
+                # Normalize to list
+                if isinstance(data, list):
+                    # Return most recent records (limit to <= 5 to avoid large payloads)
+                    result = data[:min(limit, 5)]
+                    if result:  # Only return if non-empty
+                        return result, meta
+                elif isinstance(data, dict):
+                    # Single record as dict -> convert to list
+                    return [data], meta
+        
+        # All patterns failed or returned empty
+        return [], last_meta
 
 
 def simple_sentiment_score(news_items: List[Dict[str, Any]]) -> float:

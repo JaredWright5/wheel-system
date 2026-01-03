@@ -797,6 +797,15 @@ def main() -> None:
         financial_scores_missing = 0
         financial_growth_missing = 0
         fundamentals_scores: List[int] = []
+        # Error type counters for diagnostics
+        rsi_empty = 0
+        rsi_http_error = 0
+        rsi_blocked_402 = 0
+        rsi_parse_error = 0
+        growth_empty = 0
+        growth_http_error = 0
+        growth_blocked_402 = 0
+        growth_parse_error = 0
 
         for item in universe:
             t = item.get("symbol")
@@ -822,23 +831,55 @@ def main() -> None:
                 metrics = fmp.key_metrics_ttm(t) or {}
                 news = fmp.stock_news(t, limit=50)
                 
-                # Fetch new fundamental datasets
+                # Fetch new fundamental datasets with diagnostics
                 financial_scores_data = fmp.financial_scores(t) or {}
-                financial_growth_data = fmp.financial_statement_growth(t, period="annual", limit=5) or []
+                financial_growth_data, growth_meta = fmp.financial_statement_growth_with_meta(t, period="annual", limit=5)
                 
-                # Track missing datasets
+                # Track missing datasets and error types
                 if not financial_scores_data:
                     financial_scores_missing += 1
                 if not financial_growth_data:
                     financial_growth_missing += 1
+                    # Track growth error type
+                    error_type = growth_meta.get("error_type", "empty")
+                    if error_type == "empty":
+                        growth_empty += 1
+                    elif error_type == "http_error":
+                        growth_http_error += 1
+                    elif error_type == "blocked_402":
+                        growth_blocked_402 += 1
+                    elif error_type == "parse_error":
+                        growth_parse_error += 1
                 
-                # Get RSI from Supabase cache using wheel rules parameters
-                rsi = get_rsi_from_cache(
+                # Get RSI from FMP with diagnostics (primary source)
+                rsi_value, rsi_meta = fmp.technical_indicator_rsi_with_meta(
                     t,
-                    interval=rules.rsi_interval,
                     period=rules.rsi_period,
-                    max_age_hours=RSI_MAX_AGE_HOURS
+                    interval=rules.rsi_interval,
+                    limit=1
                 )
+                
+                # Fallback to Supabase cache if FMP failed
+                if rsi_value is None:
+                    rsi_value = get_rsi_from_cache(
+                        t,
+                        interval=rules.rsi_interval,
+                        period=rules.rsi_period,
+                        max_age_hours=RSI_MAX_AGE_HOURS
+                    )
+                    # If cache also failed, track error type from FMP
+                    if rsi_value is None:
+                        error_type = rsi_meta.get("error_type", "empty")
+                        if error_type == "empty":
+                            rsi_empty += 1
+                        elif error_type == "http_error":
+                            rsi_http_error += 1
+                        elif error_type == "blocked_402":
+                            rsi_blocked_402 += 1
+                        elif error_type == "parse_error":
+                            rsi_parse_error += 1
+                
+                rsi = rsi_value
                 
                 # Track missing data
                 if not profile:
@@ -887,7 +928,7 @@ def main() -> None:
                 f_score, f_breakdown = score_fundamentals(ratios, metrics, financial_scores_data, financial_growth_data)
                 fundamentals_scores.append(f_score)
                 trend_score, t_feats = score_trend_proxy(quote)
-                tech_score = score_technical(rsi)  # RSI contributes as soft score (10% weight)
+                tech_score = score_technical(rsi_value)  # RSI contributes as soft score (10% weight)
                 
                 # Composite wheel score (weighted) - same top-level weights
                 wheel_score = clamp_int(
@@ -914,6 +955,7 @@ def main() -> None:
                 }
                 
                 # Build features dict with raw data (store all datasets in metrics)
+                # Store RSI as {"value": float|None, "period": int, "interval": str}
                 features = {
                     "profile": profile,
                     "quote": quote,
@@ -921,9 +963,11 @@ def main() -> None:
                     "key_metrics_ttm": metrics,
                     "financial_scores": financial_scores_data,
                     "financial_growth": financial_growth_data[:5] if financial_growth_data else [],  # Limit to 5 records
-                    "rsi": rsi,
-                    "rsi_period": rules.rsi_period,
-                    "rsi_interval": rules.rsi_interval,
+                    "rsi": {
+                        "value": rsi,
+                        "period": rules.rsi_period,
+                        "interval": rules.rsi_interval,
+                    },
                     "next_earnings_date": next_earnings_date.isoformat() if next_earnings_date else None,
                     "earnings_in_days": earnings_in_days,
                     "earnings_source": earnings_source,
@@ -941,7 +985,7 @@ def main() -> None:
                     market_cap=int(market_cap),
                     price=float(price),
                     beta=float(beta) if beta is not None else None,
-                    rsi=rsi,
+                    rsi=rsi_value,
                     next_earnings_date=next_earnings_date,
                     earnings_in_days=earnings_in_days,
                     earnings_source=earnings_source,
@@ -980,10 +1024,17 @@ def main() -> None:
             f"earnings_unknown={earnings_unknown}, passed_all_filters={passed_all_filters}"
         )
         
-        # Log fundamentals enrichment statistics
+        # Log fundamentals enrichment statistics with error type breakdown
         logger.info(
             f"Fundamentals enrichment: financial_scores_missing={financial_scores_missing}, "
-            f"financial_growth_missing={financial_growth_missing}"
+            f"financial_growth_missing={financial_growth_missing} "
+            f"(empty={growth_empty}, http_error={growth_http_error}, blocked_402={growth_blocked_402}, parse_error={growth_parse_error})"
+        )
+        
+        # Log RSI diagnostics
+        logger.info(
+            f"RSI diagnostics: rsi_missing={rsi_missing} "
+            f"(empty={rsi_empty}, http_error={rsi_http_error}, blocked_402={rsi_blocked_402}, parse_error={rsi_parse_error})"
         )
         
         # Log fundamentals score distribution
@@ -1033,7 +1084,7 @@ def main() -> None:
                 "key_metrics_ttm": c.features.get("key_metrics_ttm"),
                 "financial_scores": c.features.get("financial_scores"),
                 "financial_growth": c.features.get("financial_growth"),
-                "rsi": c.features.get("rsi"),
+                "rsi": c.features.get("rsi"),  # Stored as {"value": float|None, "period": int, "interval": str}
                 "sentiment": c.features.get("sentiment_raw"),
             }
             
