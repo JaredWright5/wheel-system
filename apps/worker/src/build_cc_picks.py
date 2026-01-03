@@ -501,9 +501,37 @@ def main() -> None:
     if isinstance(sec, dict):
         positions = sec.get("positions") or []
     
-    logger.info(f"Found {len(positions)} total positions")
+    positions_total = len(positions)
+    logger.info(f"Found {positions_total} total positions")
+    
+    # Log compact table-like summary for first 10 positions
+    if positions:
+        logger.info("Position summary (first 10):")
+        logger.info("  Symbol    | AssetType | Quantity | MarketValue | Description")
+        logger.info("  " + "-" * 70)
+        for i, pos in enumerate(positions[:10], start=1):
+            if not isinstance(pos, dict):
+                continue
+            instr = pos.get("instrument") or {}
+            symbol = instr.get("symbol") or instr.get("underlyingSymbol") or instr.get("cusip") or "N/A"
+            asset_type = instr.get("assetType") or pos.get("assetType") or "N/A"
+            quantity = _safe_float(pos.get("longQuantity") or pos.get("quantity"), 0.0) or 0.0
+            market_value = _safe_float(pos.get("marketValue"), 0.0) or 0.0
+            description = instr.get("description") or instr.get("name") or pos.get("description") or ""
+            desc_short = description[:30] if description else ""
+            logger.info(
+                f"  {symbol:10} | {asset_type:9} | {quantity:8.0f} | "
+                f"${market_value:11,.2f} | {desc_short}"
+            )
+        if positions_total > 10:
+            logger.info(f"  ... and {positions_total - 10} more positions")
     
     eligible_positions: List[Dict[str, Any]] = []
+    
+    # Skip reason counters
+    skipped_not_equity = 0
+    skipped_qty_zero_or_short = 0
+    skipped_missing_symbol = 0
     
     # Filter eligible positions (equities, long, quantity > 0)
     for pos in positions:
@@ -511,16 +539,40 @@ def main() -> None:
             continue
         
         instr = pos.get("instrument") or {}
-        asset_type = instr.get("assetType")
-        symbol = instr.get("symbol") or instr.get("underlyingSymbol") or ""
+        # Try multiple field paths for assetType
+        asset_type = (
+            instr.get("assetType") or
+            pos.get("assetType") or
+            instr.get("type") or
+            None
+        )
         
-        # Only equities (ignore options)
+        # Try multiple field paths for symbol
+        symbol = (
+            instr.get("symbol") or
+            instr.get("underlyingSymbol") or
+            pos.get("symbol") or
+            ""
+        ).strip()
+        
+        # Check eligibility criteria
+        # 1) Must be equity
         if asset_type not in ("EQUITY", "STOCK"):
+            skipped_not_equity += 1
             continue
         
-        # Get quantity (long only, qty > 0)
-        quantity = _safe_float(pos.get("longQuantity") or pos.get("quantity"), 0.0) or 0.0
+        # 2) Must have symbol
+        if not symbol:
+            skipped_missing_symbol += 1
+            continue
+        
+        # 3) Must have quantity > 0 (try both longQuantity and quantity)
+        long_qty = _safe_float(pos.get("longQuantity"), 0.0) or 0.0
+        qty = _safe_float(pos.get("quantity"), 0.0) or 0.0
+        quantity = max(long_qty, qty)  # Use whichever is positive
+        
         if quantity <= 0:
+            skipped_qty_zero_or_short += 1
             continue
         
         # Get current price (optional, will use from chain if missing)
@@ -541,7 +593,12 @@ def main() -> None:
             "raw_position": pos,
         })
     
-    logger.info(f"Found {len(eligible_positions)} eligible positions (equity, long, qty > 0)")
+    positions_eligible = len(eligible_positions)
+    logger.info(
+        f"Position eligibility: total={positions_total}, eligible={positions_eligible}, "
+        f"skipped_not_equity={skipped_not_equity}, skipped_qty_zero_or_short={skipped_qty_zero_or_short}, "
+        f"skipped_missing_symbol={skipped_missing_symbol}"
+    )
     
     if not eligible_positions:
         logger.warning("No eligible positions found")
@@ -837,8 +894,10 @@ def main() -> None:
     # Log summary with skip counts by reason
     logger.info(
         f"CC pick generation summary: "
-        f"processed={len(eligible_positions)}, "
-        f"created={len(pick_rows)}, "
+        f"positions_total={positions_total}, positions_eligible={positions_eligible}, "
+        f"processed={len(eligible_positions)}, created={len(pick_rows)}, "
+        f"skipped_not_equity={skipped_not_equity}, skipped_qty_zero_or_short={skipped_qty_zero_or_short}, "
+        f"skipped_missing_symbol={skipped_missing_symbol}, "
         f"skipped_earnings_blocked={skipped_earnings_blocked}, "
         f"earnings_known={earnings_known}, earnings_unknown={earnings_unknown}, "
         f"skipped_no_chain={skipped_no_chain}, "
