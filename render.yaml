@@ -50,6 +50,16 @@ services:
         value: "1"
 
   - type: cron
+    name: wheel-build-cc-picks
+    runtime: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: PYTHONPATH=/opt/render/project/src python -m apps.worker.src.build_cc_picks
+    schedule: "0 22 * * 1-5"  # Weekdays at 22:00 UTC (2:00 PM PT / 3:00 PM PDT)
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+  - type: cron
     name: wheel-rsi-snapshot
     runtime: python
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
