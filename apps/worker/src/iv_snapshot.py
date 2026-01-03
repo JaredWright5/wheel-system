@@ -353,6 +353,7 @@ def main() -> None:
         skipped_no_exp = 0
         skipped_no_iv = 0
         skipped_no_underlying = 0
+        skipped_invalid_symbol = 0
         errors = 0
         
         # Process each symbol
@@ -370,6 +371,13 @@ def main() -> None:
                 
                 # Fetch option chain
                 chain = schwab.get_option_chain(symbol)
+                
+                # Check for invalid symbol error
+                if isinstance(chain, dict) and chain.get("_error_type") == "invalid_symbol":
+                    skipped_invalid_symbol += 1
+                    symbol_request = chain.get("_symbol_request", symbol)
+                    logger.debug(f"{symbol}: invalid symbol for Schwab chain (request_symbol={symbol_request})")
+                    continue
                 
                 if not chain or not isinstance(chain, dict):
                     skipped_no_chain += 1
@@ -482,7 +490,8 @@ def main() -> None:
         logger.info(
             f"IV Snapshot complete: processed={processed}, inserted={inserted}, updated={updated}, "
             f"skipped_no_chain={skipped_no_chain}, skipped_no_exp={skipped_no_exp}, "
-            f"skipped_no_iv={skipped_no_iv}, skipped_no_underlying={skipped_no_underlying}, errors={errors}"
+            f"skipped_no_iv={skipped_no_iv}, skipped_no_underlying={skipped_no_underlying}, "
+            f"skipped_invalid_symbol={skipped_invalid_symbol}, errors={errors}"
         )
         
     except Exception as e:
