@@ -155,137 +155,189 @@ def fetch_earnings_calendar_range(
     Returns:
         Dictionary mapping universe symbol -> earliest upcoming earnings date
     """
+    CHUNK_DAYS = 7  # Configurable chunk size (7 days per chunk)
     now = datetime.now(timezone.utc).date()
     earnings_map: Dict[str, date] = {}
+    all_events: List[Dict[str, Any]] = []
     
-    try:
-        # Call FMP earnings calendar endpoint with date range
-        # Common parameters: from=YYYY-MM-DD&to=YYYY-MM-DD
-        params = {
-            "from": start_date.isoformat(),
-            "to": end_date.isoformat(),
-        }
-        
-        earnings_cal = client._get("earnings-calendar", params=params)
-        
-        if not earnings_cal:
-            logger.warning("FMP earnings calendar returned empty response")
-            return earnings_map
-        
-        if not isinstance(earnings_cal, list):
-            logger.warning(f"FMP earnings calendar returned non-list response: {type(earnings_cal)}")
-            # Log sample if dict
-            if isinstance(earnings_cal, dict):
-                sample = str(earnings_cal)[:200]
-                logger.debug(f"Sample response (first 200 chars): {sample}")
-            return earnings_map
-        
-        # Log total rows returned
-        total_rows = len(earnings_cal)
-        logger.info(f"FMP earnings calendar returned {total_rows} earnings events")
-        
-        # Build canonical universe symbol set for matching
-        universe_canon = {normalize_equity_symbol(s) for s in universe_symbols}
-        
-        # Build reverse mapping: canonical -> original (for getting original symbol after matching)
-        canonical_to_original: Dict[str, str] = {}
-        for orig_sym in universe_symbols:
-            canon_sym = normalize_equity_symbol(orig_sym)
-            canonical_to_original[canon_sym] = orig_sym
-        
-        # Parse earnings rows
-        for item in earnings_cal:
-            if not isinstance(item, dict):
+    # Build canonical universe symbol set for matching (once, before chunking)
+    universe_canon = {normalize_equity_symbol(s) for s in universe_symbols}
+    
+    # Build reverse mapping: canonical -> original (for getting original symbol after matching)
+    canonical_to_original: Dict[str, str] = {}
+    for orig_sym in universe_symbols:
+        canon_sym = normalize_equity_symbol(orig_sym)
+        canonical_to_original[canon_sym] = orig_sym
+    
+    # Generate date chunks (7-day windows)
+    chunks = []
+    chunk_start = start_date
+    while chunk_start <= end_date:
+        chunk_end = min(chunk_start + timedelta(days=CHUNK_DAYS - 1), end_date)
+        chunks.append((chunk_start, chunk_end))
+        chunk_start = chunk_end + timedelta(days=1)
+    
+    logger.info(f"Fetching earnings calendar in {len(chunks)} chunks of {CHUNK_DAYS} days each (range: {start_date.isoformat()} to {end_date.isoformat()})")
+    
+    # Fetch each chunk
+    for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks, start=1):
+        try:
+            params = {
+                "from": chunk_start.isoformat(),
+                "to": chunk_end.isoformat(),
+            }
+            
+            earnings_cal = client._get("earnings-calendar", params=params)
+            
+            if not earnings_cal:
+                logger.warning(f"Chunk {chunk_idx}/{len(chunks)} [{chunk_start.isoformat()} to {chunk_end.isoformat()}]: empty response")
                 continue
             
-            # Extract symbol (try multiple field names)
-            row_symbol = (
-                item.get("symbol") or
-                item.get("Symbol") or
-                item.get("ticker") or
-                item.get("Ticker") or
-                None
-            )
-            if not row_symbol:
+            if not isinstance(earnings_cal, list):
+                logger.warning(f"Chunk {chunk_idx}/{len(chunks)} [{chunk_start.isoformat()} to {chunk_end.isoformat()}]: non-list response (type={type(earnings_cal)})")
+                if isinstance(earnings_cal, dict):
+                    sample = str(earnings_cal)[:200]
+                    logger.debug(f"Sample response (first 200 chars): {sample}")
                 continue
             
-            # Extract earnings date (try multiple field names)
-            earnings_date_str = (
-                item.get("date") or
-                item.get("Date") or
-                item.get("earningsDate") or
-                item.get("EarningsDate") or
-                item.get("reportDate") or
-                item.get("ReportDate") or
-                None
-            )
-            if not earnings_date_str:
-                continue
+            chunk_event_count = len(earnings_cal)
+            logger.info(f"Chunk {chunk_idx}/{len(chunks)} [{chunk_start.isoformat()} to {chunk_end.isoformat()}]: {chunk_event_count} events")
+            all_events.extend(earnings_cal)
             
-            # Parse date
+        except Exception as e:
+            # Check if it's a 4xx error (402, 403, etc. - subscription/permission issues)
+            error_str = str(e)
+            if "402" in error_str or "403" in error_str or "4" in error_str[:3]:
+                body_sample = error_str[-300:] if len(error_str) > 300 else error_str
+                logger.error(
+                    f"Chunk {chunk_idx}/{len(chunks)} [{chunk_start.isoformat()} to {chunk_end.isoformat()}]: "
+                    f"4xx error (subscription/permission issue). Error: {body_sample}. Continuing..."
+                )
+            else:
+                logger.warning(
+                    f"Chunk {chunk_idx}/{len(chunks)} [{chunk_start.isoformat()} to {chunk_end.isoformat()}]: "
+                    f"fetch failed: {e}. Continuing..."
+                )
+            continue
+    
+    # Log total events collected
+    total_events_collected = len(all_events)
+    logger.info(f"Total events collected across all chunks: {total_events_collected}")
+    
+    # Compute min/max earnings dates in collected events (for debugging)
+    earnings_dates_seen: List[date] = []
+    for item in all_events:
+        if not isinstance(item, dict):
+            continue
+        earnings_date_str = (
+            item.get("date") or
+            item.get("Date") or
+            item.get("earningsDate") or
+            item.get("EarningsDate") or
+            item.get("reportDate") or
+            item.get("ReportDate") or
+            None
+        )
+        if earnings_date_str:
             try:
                 if isinstance(earnings_date_str, str):
                     if "T" in earnings_date_str:
                         earnings_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
                     else:
                         earnings_date = date.fromisoformat(earnings_date_str[:10])
-                else:
-                    continue
+                    if earnings_date >= now:
+                        earnings_dates_seen.append(earnings_date)
             except Exception:
+                pass
+    
+    if earnings_dates_seen:
+        min_earnings_date = min(earnings_dates_seen)
+        max_earnings_date = max(earnings_dates_seen)
+        logger.info(f"Earnings dates range in collected events: {min_earnings_date.isoformat()} to {max_earnings_date.isoformat()}")
+    else:
+        logger.warning("No valid future earnings dates found in collected events")
+    
+    # Parse earnings rows and map to universe symbols
+    for item in all_events:
+        if not isinstance(item, dict):
+            continue
+        
+        # Extract symbol (try multiple field names)
+        row_symbol = (
+            item.get("symbol") or
+            item.get("Symbol") or
+            item.get("ticker") or
+            item.get("Ticker") or
+            None
+        )
+        if not row_symbol:
+            continue
+        
+        # Extract earnings date (try multiple field names)
+        earnings_date_str = (
+            item.get("date") or
+            item.get("Date") or
+            item.get("earningsDate") or
+            item.get("EarningsDate") or
+            item.get("reportDate") or
+            item.get("ReportDate") or
+            None
+        )
+        if not earnings_date_str:
+            continue
+        
+        # Parse date
+        try:
+            if isinstance(earnings_date_str, str):
+                if "T" in earnings_date_str:
+                    earnings_date = datetime.fromisoformat(earnings_date_str.replace("Z", "+00:00")).date()
+                else:
+                    earnings_date = date.fromisoformat(earnings_date_str[:10])
+            else:
                 continue
-            
-            # Only consider future dates
-            if earnings_date < now:
-                continue
-            
-            # Convert provider symbol to canonical universe format
-            event_sym = to_universe_symbol(row_symbol)
-            event_sym = normalize_equity_symbol(event_sym)
-            
-            # Only map if event_sym is in canonical universe
-            if event_sym not in universe_canon:
-                continue
-            
-            # Find original universe symbol using reverse mapping
-            universe_symbol = canonical_to_original.get(event_sym)
-            if not universe_symbol:
-                continue
-            
-            # Store earliest earnings date per universe symbol
-            if universe_symbol not in earnings_map or earnings_date < earnings_map[universe_symbol]:
-                earnings_map[universe_symbol] = earnings_date
+        except Exception:
+            continue
         
-        mapped_count = len(earnings_map)
-        logger.info(f"Earnings calendar mapped to {mapped_count} unique symbols from universe")
+        # Only consider future dates
+        if earnings_date < now:
+            continue
         
-        # Log sample of unmapped universe symbols (up to 15)
-        unmapped_symbols = []
-        for sym in universe_symbols:
-            if sym not in earnings_map:
-                unmapped_symbols.append(sym)
-                if len(unmapped_symbols) >= 15:
-                    break
+        # Convert provider symbol to canonical universe format
+        event_sym = to_universe_symbol(row_symbol)
+        event_sym = normalize_equity_symbol(event_sym)
         
-        if unmapped_symbols:
-            total_unmapped = len([s for s in universe_symbols if s not in earnings_map])
-            logger.info(f"Sample of unmapped universe symbols (showing up to 15 of {total_unmapped} total): {unmapped_symbols}")
+        # Only map if event_sym is in canonical universe
+        if event_sym not in universe_canon:
+            continue
         
-    except Exception as e:
-        # Check if it's a 4xx error (402, 403, etc. - subscription/permission issues)
-        error_str = str(e)
-        if "402" in error_str or "403" in error_str or "4" in error_str[:3]:
-            # Extract response body if available
-            body_sample = error_str[-300:] if len(error_str) > 300 else error_str
-            logger.error(
-                f"FMP earnings calendar returned 4xx error (subscription/permission issue). "
-                f"Setting all earnings as unknown. Error: {body_sample}"
-            )
-        else:
-            # Other errors (network, 5xx, etc.)
-            logger.warning(f"FMP earnings calendar fetch failed: {e}. Setting all earnings as unknown.")
+        # Find original universe symbol using reverse mapping
+        universe_symbol = canonical_to_original.get(event_sym)
+        if not universe_symbol:
+            continue
         
-        # Return empty map (all earnings will be unknown)
-        return earnings_map
+        # Store earliest earnings date per universe symbol
+        if universe_symbol not in earnings_map or earnings_date < earnings_map[universe_symbol]:
+            earnings_map[universe_symbol] = earnings_date
+    
+    mapped_count = len(earnings_map)
+    logger.info(f"Earnings calendar mapped to {mapped_count} unique symbols from universe (mapped_to_universe_count={mapped_count})")
+    
+    # Calculate earnings_known/unknown for universe
+    earnings_known_count = mapped_count
+    earnings_unknown_count = len(universe_symbols) - mapped_count
+    logger.info(f"Universe earnings coverage: known={earnings_known_count}, unknown={earnings_unknown_count}")
+    
+    # Log sample of unmapped universe symbols (up to 15)
+    unmapped_symbols = []
+    for sym in universe_symbols:
+        if sym not in earnings_map:
+            unmapped_symbols.append(sym)
+            if len(unmapped_symbols) >= 15:
+                break
+    
+    if unmapped_symbols:
+        total_unmapped = len([s for s in universe_symbols if s not in earnings_map])
+        logger.info(f"Sample of unmapped universe symbols (showing up to 15 of {total_unmapped} total): {unmapped_symbols}")
     
     return earnings_map
 
