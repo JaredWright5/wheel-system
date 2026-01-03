@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import os
+import math
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -299,6 +300,21 @@ def _choose_best_put_in_delta_band(
         # Calculate spread percentage
         spread_pct = (abs_spread / mid) * 100.0 if mid > 0 else 0.0
 
+        # Get open interest for scoring
+        oi = _safe_float(o.get("openInterest"), 0.0) or 0.0
+
+        # Calculate contract_score:
+        # + annualized_yield (primary)
+        # - spread_pct * 10 (penalize wide spreads)
+        # - (1 / sqrt(open_interest + 1)) * 5 (penalize low OI)
+        # + abs(delta) * 10 (prefer closer to 0.30 than 0.20 within band)
+        contract_score = (
+            annualized_yield
+            - (spread_pct * 10.0)
+            - ((1.0 / math.sqrt(oi + 1.0)) * 5.0)
+            + (abs_delta * 10.0)
+        )
+
         candidates.append({
             **o,
             "_abs_delta": abs_delta,
@@ -307,14 +323,15 @@ def _choose_best_put_in_delta_band(
             "_mid": mid,
             "_spread_abs": abs_spread,
             "_spread_pct": spread_pct,
+            "_contract_score": contract_score,
             "_liquidity_ok": True,
         })
 
     if not candidates:
         return None
 
-    # Sort by annualized_yield descending (highest first)
-    candidates.sort(key=lambda x: x["_annualized_yield"], reverse=True)
+    # Sort by contract_score descending (highest first)
+    candidates.sort(key=lambda x: x["_contract_score"], reverse=True)
     return candidates[0]
 
 
@@ -664,6 +681,7 @@ def main() -> None:
             mid = _safe_float(best.get("_mid")) or ((bid + ask) / 2.0 if (bid > 0 and ask > 0) else premium)
             spread_abs = _safe_float(best.get("_spread_abs")) or (ask - bid if (ask > bid) else 0.0)
             spread_pct = _safe_float(best.get("_spread_pct")) or ((spread_abs / mid) * 100.0 if mid > 0 else 0.0)
+            contract_score = _safe_float(best.get("_contract_score"))
 
             # Log successful pick with window used
             logger.info(
@@ -720,6 +738,7 @@ def main() -> None:
                         "spread_abs": spread_abs,
                         "spread_pct": spread_pct,
                         "annualized_yield": ann_yld,
+                        "contract_score": contract_score,
                         "openInterest": best.get("openInterest"),
                         "volume": best.get("totalVolume") or best.get("volume"),
                         "inTheMoney": best.get("inTheMoney"),
