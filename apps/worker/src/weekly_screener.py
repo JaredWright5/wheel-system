@@ -21,7 +21,7 @@ BUILD_SHA = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "local"
 from wheel.clients.fmp_stable_client import FMPStableClient, simple_sentiment_score
 from wheel.clients.supabase_client import insert_row, upsert_rows, update_rows, get_supabase
 from apps.worker.src.config.wheel_rules import load_wheel_rules
-from apps.worker.src.utils.symbols import normalize_equity_symbol, to_universe_symbol
+from utils.symbols import normalize_equity_symbol, to_universe_symbol
 
 
 @dataclass
