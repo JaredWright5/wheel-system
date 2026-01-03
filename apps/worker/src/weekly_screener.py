@@ -21,7 +21,7 @@ BUILD_SHA = os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "local"
 from wheel.clients.fmp_stable_client import FMPStableClient, simple_sentiment_score
 from wheel.clients.supabase_client import insert_row, upsert_rows, update_rows, get_supabase
 from apps.worker.src.config.wheel_rules import load_wheel_rules
-from apps.worker.src.utils.symbols import normalize_for_fmp
+from apps.worker.src.utils.symbols import normalize_equity_symbol, to_universe_symbol
 
 
 @dataclass
@@ -137,40 +137,6 @@ def build_universe_fmp_stable(
     return filtered
 
 
-def _denormalize_symbol_from_fmp(fmp_symbol: str, universe_symbols: set) -> str:
-    """
-    Convert FMP symbol format back to universe format if needed.
-    
-    FMP returns symbols like "BRK-B", but our universe may have "BRK.B".
-    This function tries to match FMP symbols to universe symbols.
-    
-    Args:
-        fmp_symbol: Symbol from FMP (e.g., "BRK-B")
-        universe_symbols: Set of symbols in our universe (e.g., {"BRK.B", "AAPL"})
-        
-    Returns:
-        Matched universe symbol if found, otherwise original fmp_symbol
-    """
-    # If exact match, return as-is
-    if fmp_symbol in universe_symbols:
-        return fmp_symbol
-    
-    # Try converting hyphen to dot (BRK-B -> BRK.B)
-    if "-" in fmp_symbol:
-        dot_version = fmp_symbol.replace("-", ".")
-        if dot_version in universe_symbols:
-            return dot_version
-    
-    # Try converting dot to hyphen (BRK.B -> BRK-B) - should not happen but handle it
-    if "." in fmp_symbol:
-        hyphen_version = fmp_symbol.replace(".", "-")
-        if hyphen_version in universe_symbols:
-            return hyphen_version
-    
-    # No match found, return original (will not match to universe)
-    return fmp_symbol
-
-
 def fetch_earnings_calendar_range(
     client: FMPStableClient,
     start_date: date,
@@ -218,6 +184,12 @@ def fetch_earnings_calendar_range(
         total_rows = len(earnings_cal)
         logger.info(f"FMP earnings calendar returned {total_rows} earnings events")
         
+        # Build canonical universe symbol set for matching
+        canonical_universe: Dict[str, str] = {}  # canonical -> original
+        for sym in universe_symbols:
+            canonical = normalize_equity_symbol(sym)
+            canonical_universe[canonical] = sym
+        
         # Parse earnings rows
         for item in earnings_cal:
             if not isinstance(item, dict):
@@ -263,19 +235,33 @@ def fetch_earnings_calendar_range(
             if earnings_date < now:
                 continue
             
-            # Match FMP symbol to universe symbol (handle BRK-B <-> BRK.B normalization)
-            matched_symbol = _denormalize_symbol_from_fmp(fmp_symbol, universe_symbols)
+            # Convert FMP symbol to canonical universe format
+            canonical_symbol = to_universe_symbol(fmp_symbol)
             
-            # Skip if symbol not in universe
-            if matched_symbol not in universe_symbols:
+            # Skip if canonical symbol not in universe
+            if canonical_symbol not in canonical_universe:
                 continue
             
-            # Store earliest earnings date per symbol
-            if matched_symbol not in earnings_map or earnings_date < earnings_map[matched_symbol]:
-                earnings_map[matched_symbol] = earnings_date
+            # Get original universe symbol for mapping
+            universe_symbol = canonical_universe[canonical_symbol]
+            
+            # Store earliest earnings date per universe symbol
+            if universe_symbol not in earnings_map or earnings_date < earnings_map[universe_symbol]:
+                earnings_map[universe_symbol] = earnings_date
         
-        unique_symbols = len(earnings_map)
-        logger.info(f"Earnings calendar mapped to {unique_symbols} unique symbols from universe")
+        mapped_symbols_count = len(earnings_map)
+        logger.info(f"Earnings calendar mapped to {mapped_symbols_count} unique symbols from universe")
+        
+        # Log sample of unmapped universe symbols (up to 10)
+        unmapped_symbols = []
+        for sym in universe_symbols:
+            if sym not in earnings_map:
+                unmapped_symbols.append(sym)
+                if len(unmapped_symbols) >= 10:
+                    break
+        
+        if unmapped_symbols:
+            logger.info(f"Sample of unmapped universe symbols (showing up to 10 of {len([s for s in universe_symbols if s not in earnings_map])} total): {unmapped_symbols}")
         
     except Exception as e:
         # Check if it's a 4xx error (402, 403, etc. - subscription/permission issues)
