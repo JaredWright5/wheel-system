@@ -372,8 +372,8 @@ def _choose_best_put_in_delta_band(
             "_premium": mark,
             "_annualized_yield": annualized_yield,
             "_mid": mid,
-            "_spread_abs": abs_spread,
-            "_spread_pct": spread_pct,
+            "_spread_abs": spread_abs,  # From spread_details (single source of truth)
+            "_spread_pct": spread_pct,  # From spread_details (single source of truth)
             "_contract_score": contract_score,
             "_liquidity_ok": True,
         })
