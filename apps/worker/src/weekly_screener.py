@@ -2,6 +2,7 @@
 Weekly Screener v2: FMP Stable Universe + Enrichment
 Uses FMP stable endpoints for universe building, fundamentals, technicals, and sentiment.
 Integrates with WheelRules for configurable trading parameters.
+Includes Fundamentals v1 enrichment with financial scores and growth data.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 from loguru import logger
 import os
+import math
 
 # Load environment variables
 load_dotenv(".env.local")
@@ -366,68 +368,263 @@ def calculate_earnings_in_days(earnings_date: Optional[date], now: Optional[date
         return None  # Earnings in past or today
 
 
+def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+    """Safely convert to float, returning default on error."""
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except (ValueError, TypeError):
+        return default
+
+
 def score_fundamentals(
     ratios: Dict[str, Any],
-    metrics: Dict[str, Any]
-) -> tuple[int, Dict[str, Any]]:
+    metrics: Dict[str, Any],
+    financial_scores: Dict[str, Any],
+    financial_growth: List[Dict[str, Any]]
+) -> Tuple[int, Dict[str, Any]]:
     """
-    Score fundamentals based on profitability, leverage, growth, valuation.
+    Score fundamentals based on profitability, leverage, valuation, growth, and quality.
+    
+    Expanded scoring model:
+    - Profitability (0-25): netProfitMargin, operatingProfitMargin, returnOnEquity/returnOnAssets
+    - Balance sheet / leverage (0-20): debtEquity, interestCoverage, currentRatio
+    - Valuation sanity (0-15): PE, priceToFreeCashFlows, enterpriseValueMultiple
+    - Growth (0-20): revenueGrowth, epsGrowth, freeCashFlowGrowth from financial statement growth
+    - Quality / distress (0-20): Piotroski score and Altman Z-Score from financial_scores
+    
+    If a metric is missing, skip it and reweight within that sub-bucket.
     
     Returns:
-        (score 0-100, features dict)
+        (score 0-100, breakdown dict with subcomponent scores and notes)
     """
-    feats: Dict[str, Any] = {}
+    breakdown: Dict[str, Any] = {
+        "profitability": 0.0,
+        "leverage": 0.0,
+        "valuation": 0.0,
+        "growth": 0.0,
+        "quality": 0.0,
+        "notes": []
+    }
     
-    # Get ratios/metrics
-    npm = ratios.get("netProfitMarginTTM") or ratios.get("netProfitMargin")
-    opm = ratios.get("operatingProfitMarginTTM") or ratios.get("operatingProfitMargin")
-    roe = ratios.get("returnOnEquityTTM") or ratios.get("returnOnEquity")
-    pe = ratios.get("peRatioTTM") or ratios.get("peRatio") or metrics.get("peRatioTTM")
-    de = ratios.get("debtEquityRatioTTM") or ratios.get("debtEquityRatio")
+    total_score = 0.0
+    total_weight = 0.0
     
-    feats.update({"npm": npm, "opm": opm, "roe": roe, "pe": pe, "de": de})
+    # --- Profitability (0-25 points) ---
+    profitability_score = 0.0
+    profitability_weight = 0.0
     
-    s = 0.0
-    w = 0.0
-    
-    # Profitability (0-70 points)
+    npm = _safe_float(ratios.get("netProfitMarginTTM") or ratios.get("netProfitMargin"))
     if npm is not None:
-        s += (min(max(npm, -0.10), 0.30) + 0.10) / 0.40 * 25
-        w += 25
+        # Normalize: -10% to 30% -> 0 to 1
+        normalized = (min(max(npm, -0.10), 0.30) + 0.10) / 0.40
+        profitability_score += normalized * 10.0
+        profitability_weight += 10.0
+    
+    opm = _safe_float(ratios.get("operatingProfitMarginTTM") or ratios.get("operatingProfitMargin"))
     if opm is not None:
-        s += (min(max(opm, -0.10), 0.35) + 0.10) / 0.45 * 20
-        w += 20
+        # Normalize: -10% to 35% -> 0 to 1
+        normalized = (min(max(opm, -0.10), 0.35) + 0.10) / 0.45
+        profitability_score += normalized * 8.0
+        profitability_weight += 8.0
+    
+    roe = _safe_float(ratios.get("returnOnEquityTTM") or ratios.get("returnOnEquity"))
+    roa = _safe_float(ratios.get("returnOnAssetsTTM") or ratios.get("returnOnAssets"))
     if roe is not None:
-        s += min(max(roe, 0.0), 0.35) / 0.35 * 25
-        w += 25
+        # Normalize: 0% to 35% -> 0 to 1
+        normalized = min(max(roe, 0.0), 0.35) / 0.35
+        profitability_score += normalized * 7.0
+        profitability_weight += 7.0
+    elif roa is not None:
+        # Fallback to ROA if ROE missing
+        normalized = min(max(roa, 0.0), 0.20) / 0.20
+        profitability_score += normalized * 7.0
+        profitability_weight += 7.0
     
-    # Valuation (0-20 points)
-    if pe is not None and pe > 0:
-        if pe <= 25:
-            v = 1.0
-        elif pe <= 40:
-            v = 1.0 - (pe - 25) / 15 * 0.6
-        else:
-            v = 0.2
-        s += v * 20
-        w += 20
+    if profitability_weight > 0:
+        profitability_final = (profitability_score / profitability_weight) * 25.0
+        breakdown["profitability"] = profitability_final
+        total_score += profitability_final
+        total_weight += 25.0
+    else:
+        breakdown["notes"].append("profitability: no data")
     
-    # Leverage (0-10 points)
+    # --- Balance sheet / leverage (0-20 points) ---
+    leverage_score = 0.0
+    leverage_weight = 0.0
+    
+    de = _safe_float(ratios.get("debtEquityRatioTTM") or ratios.get("debtEquityRatio"))
     if de is not None and de >= 0:
+        # Lower is better: 0-1.0 = 1.0, 1.0-2.5 = linear decay, >2.5 = 0.2
         if de <= 1.0:
             v = 1.0
         elif de <= 2.5:
             v = 1.0 - (de - 1.0) / 1.5 * 0.7
         else:
             v = 0.2
-        s += v * 10
-        w += 10
+        leverage_score += v * 8.0
+        leverage_weight += 8.0
     
-    if w == 0:
-        return 40, feats
+    interest_coverage = _safe_float(ratios.get("interestCoverageTTM") or ratios.get("interestCoverage"))
+    if interest_coverage is not None and interest_coverage > 0:
+        # Higher is better: >= 5 = 1.0, 2-5 = linear, <2 = 0.3
+        if interest_coverage >= 5.0:
+            v = 1.0
+        elif interest_coverage >= 2.0:
+            v = 0.3 + (interest_coverage - 2.0) / 3.0 * 0.7
+        else:
+            v = 0.3
+        leverage_score += v * 6.0
+        leverage_weight += 6.0
     
-    score = (s / w) * 100
-    return clamp_int(score, 0, 100), feats
+    current_ratio = _safe_float(ratios.get("currentRatioTTM") or ratios.get("currentRatio"))
+    if current_ratio is not None and current_ratio > 0:
+        # Ideal: 1.5-3.0 = 1.0, outside range = lower score
+        if 1.5 <= current_ratio <= 3.0:
+            v = 1.0
+        elif current_ratio < 1.5:
+            v = current_ratio / 1.5
+        else:
+            v = max(0.5, 1.0 - (current_ratio - 3.0) / 3.0)
+        leverage_score += v * 6.0
+        leverage_weight += 6.0
+    
+    if leverage_weight > 0:
+        leverage_final = (leverage_score / leverage_weight) * 20.0
+        breakdown["leverage"] = leverage_final
+        total_score += leverage_final
+        total_weight += 20.0
+    else:
+        breakdown["notes"].append("leverage: no data")
+    
+    # --- Valuation sanity (0-15 points) ---
+    valuation_score = 0.0
+    valuation_weight = 0.0
+    
+    pe = _safe_float(ratios.get("peRatioTTM") or ratios.get("peRatio") or metrics.get("peRatioTTM"))
+    if pe is not None and pe > 0:
+        # Lower is better: <= 25 = 1.0, 25-40 = linear decay, >40 = 0.2
+        if pe <= 25:
+            v = 1.0
+        elif pe <= 40:
+            v = 1.0 - (pe - 25) / 15 * 0.6
+        else:
+            v = 0.2
+        valuation_score += v * 5.0
+        valuation_weight += 5.0
+    
+    price_to_fcf = _safe_float(metrics.get("priceToFreeCashFlowsTTM") or metrics.get("priceToFreeCashFlows"))
+    if price_to_fcf is not None and price_to_fcf > 0:
+        # Lower is better: <= 20 = 1.0, 20-40 = linear decay, >40 = 0.3
+        if price_to_fcf <= 20:
+            v = 1.0
+        elif price_to_fcf <= 40:
+            v = 1.0 - (price_to_fcf - 20) / 20 * 0.5
+        else:
+            v = 0.3
+        valuation_score += v * 5.0
+        valuation_weight += 5.0
+    
+    ev_multiple = _safe_float(metrics.get("enterpriseValueMultipleTTM") or metrics.get("enterpriseValueMultiple"))
+    if ev_multiple is not None and ev_multiple > 0:
+        # Lower is better: <= 15 = 1.0, 15-30 = linear decay, >30 = 0.3
+        if ev_multiple <= 15:
+            v = 1.0
+        elif ev_multiple <= 30:
+            v = 1.0 - (ev_multiple - 15) / 15 * 0.5
+        else:
+            v = 0.3
+        valuation_score += v * 5.0
+        valuation_weight += 5.0
+    
+    if valuation_weight > 0:
+        valuation_final = (valuation_score / valuation_weight) * 15.0
+        breakdown["valuation"] = valuation_final
+        total_score += valuation_final
+        total_weight += 15.0
+    else:
+        breakdown["notes"].append("valuation: no data")
+    
+    # --- Growth (0-20 points) ---
+    growth_score = 0.0
+    growth_weight = 0.0
+    
+    # Use most recent growth record (first in list if sorted by date desc)
+    growth_record = financial_growth[0] if financial_growth and isinstance(financial_growth[0], dict) else {}
+    
+    revenue_growth = _safe_float(growth_record.get("revenueGrowth") or growth_record.get("revenueGrowthRate"))
+    if revenue_growth is not None:
+        # Normalize: -20% to 30% -> 0 to 1
+        normalized = (min(max(revenue_growth, -0.20), 0.30) + 0.20) / 0.50
+        growth_score += normalized * 7.0
+        growth_weight += 7.0
+    
+    eps_growth = _safe_float(growth_record.get("epsGrowth") or growth_record.get("epsGrowthRate"))
+    if eps_growth is not None:
+        # Normalize: -30% to 40% -> 0 to 1
+        normalized = (min(max(eps_growth, -0.30), 0.40) + 0.30) / 0.70
+        growth_score += normalized * 7.0
+        growth_weight += 7.0
+    
+    fcf_growth = _safe_float(growth_record.get("freeCashFlowGrowth") or growth_record.get("freeCashFlowGrowthRate"))
+    if fcf_growth is not None:
+        # Normalize: -50% to 50% -> 0 to 1
+        normalized = (min(max(fcf_growth, -0.50), 0.50) + 0.50) / 1.0
+        growth_score += normalized * 6.0
+        growth_weight += 6.0
+    
+    if growth_weight > 0:
+        growth_final = (growth_score / growth_weight) * 20.0
+        breakdown["growth"] = growth_final
+        total_score += growth_final
+        total_weight += 20.0
+    else:
+        breakdown["notes"].append("growth: no data")
+    
+    # --- Quality / distress (0-20 points) ---
+    quality_score = 0.0
+    quality_weight = 0.0
+    
+    piotroski = _safe_float(financial_scores.get("piotroskiScore") or financial_scores.get("piotroski"))
+    if piotroski is not None:
+        # Piotroski: 0-9 scale, normalize to 0-1
+        normalized = min(max(piotroski, 0.0), 9.0) / 9.0
+        quality_score += normalized * 10.0
+        quality_weight += 10.0
+    
+    altman_z = _safe_float(financial_scores.get("altmanZScore") or financial_scores.get("altmanZ"))
+    if altman_z is not None:
+        # Altman Z: <1.8 = distress, 1.8-2.99 = gray, >=3 = safe
+        # Score: >=3 = 1.0, 2.5-3 = 0.8, 1.8-2.5 = 0.5, <1.8 = 0.2
+        if altman_z >= 3.0:
+            v = 1.0
+        elif altman_z >= 2.5:
+            v = 0.8
+        elif altman_z >= 1.8:
+            v = 0.5
+        else:
+            v = 0.2
+        quality_score += v * 10.0
+        quality_weight += 10.0
+    
+    if quality_weight > 0:
+        quality_final = (quality_score / quality_weight) * 20.0
+        breakdown["quality"] = quality_final
+        total_score += quality_final
+        total_weight += 20.0
+    else:
+        breakdown["notes"].append("quality: no data")
+    
+    # Final score: normalize to 0-100 if we have any weight
+    if total_weight > 0:
+        final_score = (total_score / total_weight) * 100.0
+    else:
+        # No data at all - return neutral score
+        final_score = 40.0
+        breakdown["notes"].append("fundamentals: no data available")
+    
+    return clamp_int(final_score, 0, 100), breakdown
 
 
 def score_sentiment(sent: float) -> int:
@@ -597,6 +794,9 @@ def main() -> None:
         earnings_known = 0
         earnings_unknown = 0
         passed_all_filters = 0
+        financial_scores_missing = 0
+        financial_growth_missing = 0
+        fundamentals_scores: List[int] = []
 
         for item in universe:
             t = item.get("symbol")
@@ -621,6 +821,16 @@ def main() -> None:
                 ratios = fmp.ratios_ttm(t) or {}
                 metrics = fmp.key_metrics_ttm(t) or {}
                 news = fmp.stock_news(t, limit=50)
+                
+                # Fetch new fundamental datasets
+                financial_scores_data = fmp.financial_scores(t) or {}
+                financial_growth_data = fmp.financial_statement_growth(t, period="annual", limit=5) or []
+                
+                # Track missing datasets
+                if not financial_scores_data:
+                    financial_scores_missing += 1
+                if not financial_growth_data:
+                    financial_growth_missing += 1
                 
                 # Get RSI from Supabase cache using wheel rules parameters
                 rsi = get_rsi_from_cache(
@@ -673,12 +883,13 @@ def main() -> None:
                 sent = simple_sentiment_score(news)
                 sent_score = score_sentiment(sent)
                 
-                # Compute scores
-                f_score, f_feats = score_fundamentals(ratios, metrics)
+                # Compute scores with expanded fundamentals model
+                f_score, f_breakdown = score_fundamentals(ratios, metrics, financial_scores_data, financial_growth_data)
+                fundamentals_scores.append(f_score)
                 trend_score, t_feats = score_trend_proxy(quote)
                 tech_score = score_technical(rsi)  # RSI contributes as soft score (10% weight)
                 
-                # Composite wheel score (weighted)
+                # Composite wheel score (weighted) - same top-level weights
                 wheel_score = clamp_int(
                     0.50 * f_score +      # Fundamentals: 50%
                     0.20 * sent_score +   # Sentiment: 20%
@@ -702,12 +913,14 @@ def main() -> None:
                     "notes": "IV sourced from Schwab in pick builder; weekly_screener does not require IV to run"
                 }
                 
-                # Build features dict with raw data
+                # Build features dict with raw data (store all datasets in metrics)
                 features = {
                     "profile": profile,
                     "quote": quote,
-                    "ratios": ratios,
-                    "metrics": metrics,
+                    "ratios_ttm": ratios,
+                    "key_metrics_ttm": metrics,
+                    "financial_scores": financial_scores_data,
+                    "financial_growth": financial_growth_data[:5] if financial_growth_data else [],  # Limit to 5 records
                     "rsi": rsi,
                     "rsi_period": rules.rsi_period,
                     "rsi_interval": rules.rsi_interval,
@@ -716,7 +929,7 @@ def main() -> None:
                     "earnings_source": earnings_source,
                     "news_count": len(news),
                     "sentiment_raw": sent,
-                    "fundamentals": f_feats,
+                    "fundamentals_breakdown": f_breakdown,  # Store breakdown in features
                     "trend": t_feats,
                 }
                 
@@ -767,6 +980,24 @@ def main() -> None:
             f"earnings_unknown={earnings_unknown}, passed_all_filters={passed_all_filters}"
         )
         
+        # Log fundamentals enrichment statistics
+        logger.info(
+            f"Fundamentals enrichment: financial_scores_missing={financial_scores_missing}, "
+            f"financial_growth_missing={financial_growth_missing}"
+        )
+        
+        # Log fundamentals score distribution
+        if fundamentals_scores:
+            fundamentals_scores_sorted = sorted(fundamentals_scores)
+            n = len(fundamentals_scores_sorted)
+            min_score = fundamentals_scores_sorted[0]
+            median_score = fundamentals_scores_sorted[n // 2] if n > 0 else 0
+            max_score = fundamentals_scores_sorted[-1]
+            logger.info(
+                f"Fundamentals score distribution: min={min_score}, median={median_score}, max={max_score}, "
+                f"n={n}"
+            )
+        
         # Upsert tickers
         logger.info(f"Upserting tickers: {len(ticker_rows)}")
         upsert_rows("tickers", ticker_rows)
@@ -779,9 +1010,13 @@ def main() -> None:
         # Write screening_candidates rows
         cand_rows: List[Dict[str, Any]] = []
         for i, c in enumerate(candidates, start=1):
+            # Extract fundamentals breakdown from features
+            fundamentals_breakdown = c.features.get("fundamentals_breakdown", {})
+            
             metrics_json = {
                 "wheel_score": c.wheel_score,
                 "fundamentals_score": c.fundamentals_score,
+                "fundamentals_breakdown": fundamentals_breakdown,  # Store breakdown in metrics
                 "sentiment_score": c.sentiment_score,
                 "trend_score": c.trend_score,
                 "technical_score": c.technical_score,
@@ -791,7 +1026,15 @@ def main() -> None:
                 "earnings_in_days": c.earnings_in_days,
                 "earnings_source": c.earnings_source,
                 "reasons": c.reasons,
-                "features": c.features,  # Full raw data dump
+                # Store all raw datasets in metrics
+                "profile": c.features.get("profile"),
+                "quote": c.features.get("quote"),
+                "ratios_ttm": c.features.get("ratios_ttm"),
+                "key_metrics_ttm": c.features.get("key_metrics_ttm"),
+                "financial_scores": c.features.get("financial_scores"),
+                "financial_growth": c.features.get("financial_growth"),
+                "rsi": c.features.get("rsi"),
+                "sentiment": c.features.get("sentiment_raw"),
             }
             
             # Build row - try explicit columns first, fallback to metadata JSON

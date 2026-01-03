@@ -368,6 +368,99 @@ class FMPStableClient:
             logger.debug(f"FMP technical_indicator_rsi({original_symbol} -> {symbol}) error: {e}")
             return None
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=1, max=15),
+        retry=retry_if_exception_type(requests.HTTPError),
+    )
+    def financial_scores(self, symbol: str) -> Dict[str, Any]:
+        """
+        Get financial scores (Piotroski score, Altman Z-Score, etc.) for a symbol.
+        
+        Args:
+            symbol: Stock symbol (e.g., "AAPL")
+            
+        Returns:
+            Dictionary with financial scores, or {} if not found or on error
+        """
+        original_symbol = symbol
+        symbol = normalize_for_fmp(symbol)
+        try:
+            data = self._get("financial-scores", params={"symbol": symbol})
+            if isinstance(data, list) and data:
+                return data[0]
+            if isinstance(data, dict):
+                return data
+            return {}
+        except requests.HTTPError as e:
+            # Handle 402 Payment Required and 404 gracefully
+            if hasattr(e, 'response') and e.response:
+                status_code = e.response.status_code
+                if status_code == 402:
+                    logger.warning(f"FMP financial_scores({original_symbol} -> {symbol}) failed: 402 Payment Required (subscription tier)")
+                    return {}
+                if status_code == 404:
+                    return {}
+            logger.warning(f"FMP financial_scores({original_symbol} -> {symbol}) failed: {e}")
+            return {}
+        except Exception as e:
+            logger.warning(f"FMP financial_scores({original_symbol} -> {symbol}) unexpected error: {e}")
+            return {}
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=1, max=15),
+        retry=retry_if_exception_type(requests.HTTPError),
+    )
+    def financial_statement_growth(
+        self,
+        symbol: str,
+        period: str = "annual",
+        limit: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Get financial statement growth data for a symbol.
+        
+        Args:
+            symbol: Stock symbol (e.g., "AAPL")
+            period: Period type ("annual" or "quarter")
+            limit: Maximum number of periods to return (default 5)
+            
+        Returns:
+            List of growth records (most recent first), or [] if not found or on error
+        """
+        original_symbol = symbol
+        symbol = normalize_for_fmp(symbol)
+        try:
+            params = {"symbol": symbol}
+            # Include period and limit if endpoint supports them
+            if period:
+                params["period"] = period
+            if limit:
+                params["limit"] = limit
+            
+            data = self._get("financial-statement-growth", params=params)
+            if isinstance(data, list):
+                # Return most recent records (limit to <= 5 to avoid large payloads)
+                return data[:min(limit, 5)]
+            if isinstance(data, dict):
+                return [data]
+            return []
+        except requests.HTTPError as e:
+            # Handle 402 Payment Required and 404 gracefully
+            if hasattr(e, 'response') and e.response:
+                status_code = e.response.status_code
+                if status_code == 402:
+                    logger.warning(f"FMP financial_statement_growth({original_symbol} -> {symbol}) failed: 402 Payment Required (subscription tier)")
+                    return []
+                if status_code == 404:
+                    return []
+            logger.warning(f"FMP financial_statement_growth({original_symbol} -> {symbol}) failed: {e}")
+            return []
+        except Exception as e:
+            logger.warning(f"FMP financial_statement_growth({original_symbol} -> {symbol}) unexpected error: {e}")
+            return []
+
 
 def simple_sentiment_score(news_items: List[Dict[str, Any]]) -> float:
     """
@@ -402,4 +495,3 @@ def simple_sentiment_score(news_items: List[Dict[str, Any]]) -> float:
     raw = score / max(1, n)
     raw = max(-3, min(3, raw))
     return raw / 3.0
-
