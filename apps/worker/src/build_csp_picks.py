@@ -2060,7 +2060,7 @@ def main() -> None:
         )
 
     # 2b) Build trade cards for selected picks
-    from datetime import datetime, timedelta
+    # datetime and timedelta already imported at top as dt and timedelta
     from zoneinfo import ZoneInfo
     
     for idx in sorted(selected_indices):
