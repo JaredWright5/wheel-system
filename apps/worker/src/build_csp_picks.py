@@ -2143,7 +2143,7 @@ def main() -> None:
         }
         
         # Store trade card in pick_metrics
-        pick_metrics["trade_card"] = trade_card
+        pick_rows[idx]["pick_metrics"]["trade_card"] = trade_card
     
     # 2c) Log trade cards for selected picks
     if selected_indices:
