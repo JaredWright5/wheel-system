@@ -1773,6 +1773,130 @@ def main() -> None:
             f"Set WHEEL_ALLOW_NEGATIVE_SELECTION=true to override."
         )
 
+    # 2b) Build trade cards for selected picks
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    
+    for idx in sorted(selected_indices):
+        pick = pick_rows[idx]
+        pick_metrics = pick.get("pick_metrics", {})
+        option_selected = pick_metrics.get("option_selected", {})
+        metadata = pick_metrics.get("metadata", {})
+        portfolio_info = metadata.get("portfolio", {})
+        underlying_breakdown = option_selected.get("underlying_breakdown", {})
+        score_components = metadata.get("score_components", {})
+        
+        # Extract earnings date if available (compute from earn_in_days)
+        earn_in_days = pick.get("earn_in_days")
+        earnings_date = None
+        days_to_earnings = None
+        if earn_in_days is not None:
+            try:
+                earn_days_int = int(earn_in_days)
+                if earn_days_int >= 0:
+                    # Approximate earnings date (today + days)
+                    today = datetime.now(ZoneInfo("America/Los_Angeles")).date()
+                    earnings_date = (today + timedelta(days=earn_days_int)).isoformat()
+                    days_to_earnings = earn_days_int
+            except (ValueError, TypeError):
+                pass
+        
+        # Extract RSI value (may be dict or float)
+        rsi_value = pick.get("rsi")
+        if isinstance(rsi_value, dict):
+            rsi_value = rsi_value.get("value")
+        
+        # Extract fundamentals score from metadata
+        fundamentals_score = None
+        if metadata:
+            # Try multiple paths
+            fund_score_raw = metadata.get("fundamentals_score") or metadata.get("fundamentals_score_total")
+            if fund_score_raw is None:
+                # Try from underlying_breakdown
+                fund_score_raw = underlying_breakdown.get("fundamentals_score")
+            if fund_score_raw is not None:
+                try:
+                    fundamentals_score = float(fund_score_raw)
+                except (ValueError, TypeError):
+                    pass
+        
+        # Build trade card
+        trade_card = {
+            "symbol": pick.get("ticker"),
+            "action": "SELL_TO_OPEN",
+            "type": "CSP",
+            "exp_date": pick.get("expiration"),  # ISO format date string
+            "dte": pick.get("dte"),
+            "strike": pick.get("strike"),
+            "delta": pick.get("delta"),
+            "bid": option_selected.get("bid"),
+            "ask": option_selected.get("ask"),
+            "mid": option_selected.get("mid"),
+            "spread_abs": option_selected.get("spread_abs"),
+            "spread_pct": option_selected.get("spread_pct"),
+            "credit_assumed": option_selected.get("bid"),  # Use bid as credit
+            "required_cash_net": portfolio_info.get("required_cash_net"),
+            "yield_annualized": pick.get("annualized_yield"),
+            "earnings_date": earnings_date,
+            "days_to_earnings": days_to_earnings,
+            "fundamentals_score": fundamentals_score,
+            "rsi": rsi_value,
+            "iv_current": pick.get("iv"),
+            "iv_rank": pick.get("iv_rank"),
+            "score_breakdown": {
+                "total_score": metadata.get("total_score") or metadata.get("chosen_total_score"),
+                "contract_score": option_selected.get("contract_score"),
+                "underlying_bonus": option_selected.get("underlying_bonus"),
+                "fundamentals_bonus": underlying_breakdown.get("fundamentals_bonus"),
+                "rsi_bonus": underlying_breakdown.get("rsi_bonus"),
+                "iv_bonus": underlying_breakdown.get("iv_bonus"),
+                "mr_bonus": underlying_breakdown.get("mr_bonus"),
+                "fundamentals_penalty": underlying_breakdown.get("fundamentals_penalty"),
+                "liquidity_bonus": option_selected.get("liquidity_bonus"),
+            },
+        }
+        
+        # Store trade card in pick_metrics
+        pick_metrics["trade_card"] = trade_card
+    
+    # 2c) Log trade cards for selected picks
+    if selected_indices:
+        logger.info("=" * 80)
+        logger.info("TRADE CARDS (Selected for Portfolio):")
+        logger.info("=" * 80)
+        for idx in sorted(selected_indices):
+            pick = pick_rows[idx]
+            trade_card = pick.get("pick_metrics", {}).get("trade_card", {})
+            symbol = trade_card.get("symbol", "UNKNOWN")
+            exp_date = trade_card.get("exp_date", "UNKNOWN")
+            strike = trade_card.get("strike", 0.0)
+            delta = trade_card.get("delta", 0.0)
+            bid = trade_card.get("bid", 0.0)
+            cash_net = trade_card.get("required_cash_net", 0.0)
+            total_score = trade_card.get("score_breakdown", {}).get("total_score", 0.0)
+            
+            # First line: main trade details
+            logger.info(
+                f"TRADE CARD: {symbol} SELL CSP {exp_date} ${strike:.2f} "
+                f"(delta={delta:.3f}, bid=${bid:.2f}, cash=${cash_net:,.2f}, total_score={total_score:.2f})"
+            )
+            
+            # Second line: fundamentals/rsi/iv/earnings
+            fund_score = trade_card.get("fundamentals_score")
+            rsi = trade_card.get("rsi")
+            iv_current = trade_card.get("iv_current")
+            iv_rank = trade_card.get("iv_rank")
+            days_to_earn = trade_card.get("days_to_earnings")
+            
+            fund_str = f"fund={fund_score:.1f}" if fund_score is not None else "fund=N/A"
+            rsi_str = f"rsi={rsi:.1f}" if rsi is not None else "rsi=N/A"
+            iv_str = f"iv={iv_current:.2f}" if iv_current is not None else "iv=N/A"
+            iv_rank_str = f"iv_rank={iv_rank:.1f}" if iv_rank is not None else "iv_rank=N/A"
+            earn_str = f"earn_in={days_to_earn}d" if days_to_earn is not None else "earn=N/A"
+            
+            logger.info(f"  └─ {fund_str} | {rsi_str} | {iv_str} ({iv_rank_str}) | {earn_str}")
+        logger.info("=" * 80)
+
     # 3) Delete existing CSP picks for this run_id, then insert new ones
     # (This ensures idempotent reruns)
     logger.info(f"Deleting existing CSP picks for run_id={run_id}")
