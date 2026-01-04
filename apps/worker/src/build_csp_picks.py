@@ -119,6 +119,80 @@ def _safe_float(x, default=None):
         return default
 
 
+def compute_underlying_bonus(c: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
+    """
+    Compute underlying bonus from candidate metrics (fundamentals, RSI, IV).
+    
+    Returns:
+        (underlying_bonus, breakdown_dict)
+        - underlying_bonus: bounded bonus (-10 to +25)
+        - breakdown_dict: {"fundamentals_bonus": float, "rsi_bonus": float, "iv_bonus": float, "mr_bonus": float}
+    """
+    metrics = c.get("metrics") or {}
+    breakdown = {
+        "fundamentals_bonus": 0.0,
+        "rsi_bonus": 0.0,
+        "iv_bonus": 0.0,
+        "mr_bonus": 0.0,
+    }
+    
+    # 1) Fundamentals bonus (0 to +15)
+    # Read fundamentals_score_total from metrics
+    fund_score = metrics.get("fundamentals_score") or metrics.get("fundamentals_score_total")
+    if fund_score is not None:
+        fund_score_float = _safe_float(fund_score, 50.0)
+        # fundamentals_bonus = clamp((fund_score - 50) / 50, 0, 1) * 15
+        # So 50 => 0, 100 => +15
+        normalized = max(0.0, min(1.0, (fund_score_float - 50.0) / 50.0))
+        breakdown["fundamentals_bonus"] = normalized * 15.0
+    
+    # 2) RSI mean reversion bonus (-5 to +5)
+    rsi_data = metrics.get("rsi") or {}
+    rsi_value = rsi_data.get("value") if isinstance(rsi_data, dict) else (rsi_data if isinstance(rsi_data, (int, float)) else None)
+    rsi = _safe_float(rsi_value)
+    
+    if rsi is None:
+        breakdown["rsi_bonus"] = 0.0
+    else:
+        if rsi <= 35:
+            breakdown["rsi_bonus"] = 5.0
+        elif rsi < 50:
+            breakdown["rsi_bonus"] = 2.0
+        elif rsi <= 65:
+            breakdown["rsi_bonus"] = 0.0
+        elif rsi < 75:
+            breakdown["rsi_bonus"] = -2.0
+        else:  # rsi >= 75
+            breakdown["rsi_bonus"] = -5.0
+    
+    # 3) IV regime bonus (0 to +10)
+    iv_data = metrics.get("iv") or {}
+    iv_rank = _safe_float(iv_data.get("rank") if isinstance(iv_data, dict) else None)
+    iv_current = _safe_float(iv_data.get("current") if isinstance(iv_data, dict) else None)
+    
+    if iv_rank is not None:
+        # iv_bonus = (iv_rank / 100) * 10
+        breakdown["iv_bonus"] = (iv_rank / 100.0) * 10.0
+    elif iv_current is not None:
+        # Tiny bonus until rank history exists
+        breakdown["iv_bonus"] = 2.0
+    else:
+        breakdown["iv_bonus"] = 0.0
+    
+    # 4) Mean reversion kicker (0 to +5)
+    iv_zscore = _safe_float(iv_data.get("zscore") if isinstance(iv_data, dict) else None)
+    if iv_zscore is not None and iv_zscore >= 1.0 and rsi is not None and rsi <= 40:
+        breakdown["mr_bonus"] = 5.0
+    else:
+        breakdown["mr_bonus"] = 0.0
+    
+    # Total bonus: cap at +25, floor at -10
+    total_bonus = sum(breakdown.values())
+    underlying_bonus = max(-10.0, min(25.0, total_bonus))
+    
+    return underlying_bonus, breakdown
+
+
 def _fetch_portfolio_budget_from_schwab() -> Tuple[float, str]:
     """
     Fetch portfolio cash budget from Schwab account balances with robust schema handling.
@@ -910,6 +984,9 @@ def main() -> None:
                 logger.warning(f"{ticker}: no expirations found in chain")
                 continue
 
+            # Compute underlying_bonus once per candidate (used in scoring and comparison)
+            underlying_bonus, underlying_breakdown = compute_underlying_bonus(c)
+
             # Try primary window first
             best_primary, exp_primary, diag_primary = attempt_window(
                 window_name="primary",
@@ -946,7 +1023,8 @@ def main() -> None:
                 )
                 
                 if best_fallback:
-                    # Both windows succeeded - compare using total_score
+                    # Both windows succeeded - compare using total_score (includes underlying_bonus)
+                    # underlying_bonus already computed above (same for both windows)
                     # Extract primary comparison data
                     strike_primary = _safe_float(best_primary.get("strike"))
                     delta_primary = _safe_float(best_primary.get("delta"))
@@ -955,7 +1033,7 @@ def main() -> None:
                     oi_primary = _safe_float(best_primary.get("openInterest"), 0.0) or 0.0
                     liquidity_bonus_primary = max(0.0, (0.05 - spread_pct_primary) * 100.0)
                     contract_score_primary = _safe_float(best_primary.get("_contract_score"), 0.0) or 0.0
-                    total_score_primary = contract_score_primary + liquidity_bonus_primary
+                    total_score_primary = contract_score_primary + liquidity_bonus_primary + underlying_bonus
                     
                     # Extract fallback comparison data
                     strike_fallback = _safe_float(best_fallback.get("strike"))
@@ -965,12 +1043,13 @@ def main() -> None:
                     oi_fallback = _safe_float(best_fallback.get("openInterest"), 0.0) or 0.0
                     liquidity_bonus_fallback = max(0.0, (0.05 - spread_pct_fallback) * 100.0)
                     contract_score_fallback = _safe_float(best_fallback.get("_contract_score"), 0.0) or 0.0
-                    total_score_fallback = contract_score_fallback + liquidity_bonus_fallback
+                    total_score_fallback = contract_score_fallback + liquidity_bonus_fallback + underlying_bonus
                     
-                    # Store comparison data
+                    # Store comparison data (underlying_bonus computed above)
                     primary_comparison_data = {
                         "contract_score": contract_score_primary,
                         "total_score": total_score_primary,
+                        "underlying_bonus": underlying_bonus,
                         "exp": exp_primary.isoformat(),
                         "strike": strike_primary,
                         "delta": delta_primary,
@@ -981,6 +1060,7 @@ def main() -> None:
                     fallback_comparison_data = {
                         "contract_score": contract_score_fallback,
                         "total_score": total_score_fallback,
+                        "underlying_bonus": underlying_bonus,
                         "exp": exp_fallback.isoformat(),
                         "strike": strike_fallback,
                         "delta": delta_fallback,
@@ -997,16 +1077,16 @@ def main() -> None:
                         selection_reason = "fallback_better_score"
                         logger.info(
                             f"{ticker}: fallback selected | "
-                            f"primary_score={total_score_primary:.4f} (contract={contract_score_primary:.4f} + bonus={liquidity_bonus_primary:.4f}) | "
-                            f"fallback_score={total_score_fallback:.4f} (contract={contract_score_fallback:.4f} + bonus={liquidity_bonus_fallback:.4f})"
+                            f"primary_total={total_score_primary:.4f} (contract={contract_score_primary:.4f} + liq={liquidity_bonus_primary:.4f} + underlying={underlying_bonus:.4f}) | "
+                            f"fallback_total={total_score_fallback:.4f} (contract={contract_score_fallback:.4f} + liq={liquidity_bonus_fallback:.4f} + underlying={underlying_bonus:.4f})"
                         )
                     else:
                         window_used = "primary"
                         selection_reason = "primary_better_score"
                         logger.info(
                             f"{ticker}: primary selected | "
-                            f"primary_score={total_score_primary:.4f} (contract={contract_score_primary:.4f} + bonus={liquidity_bonus_primary:.4f}) | "
-                            f"fallback_score={total_score_fallback:.4f} (contract={contract_score_fallback:.4f} + bonus={liquidity_bonus_fallback:.4f})"
+                            f"primary_total={total_score_primary:.4f} (contract={contract_score_primary:.4f} + liq={liquidity_bonus_primary:.4f} + underlying={underlying_bonus:.4f}) | "
+                            f"fallback_total={total_score_fallback:.4f} (contract={contract_score_fallback:.4f} + liq={liquidity_bonus_fallback:.4f} + underlying={underlying_bonus:.4f})"
                         )
                 else:
                     # Primary succeeded, fallback failed - use primary
@@ -1158,19 +1238,25 @@ def main() -> None:
                     + (abs_delta * 10.0)
                 )
 
-            # Calculate liquidity bonus and total_score (for comparison logging only)
+            # Calculate liquidity bonus
             liquidity_bonus = max(0.0, (0.05 - spread_pct) * 100.0)
-            total_score = contract_score + liquidity_bonus
+            
+            # underlying_bonus already computed above (before window selection)
+            # Total score = contract_score + liquidity_bonus + underlying_bonus
+            total_score = contract_score + liquidity_bonus + underlying_bonus
 
             # Calculate required cash for CSP
             required_cash = strike * 100.0  # Full assignment value
             required_cash_net = required_cash - (bid * 100.0)  # Net cash after premium received
 
-            # Log successful pick with contract_score
+            # Log successful pick with total_score breakdown
             logger.info(
                 f"{ticker}: pick created | window={window_used} | "
                 f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
-                f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | score={contract_score:.4f} | "
+                f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
+                f"total_score={total_score:.4f} (contract={contract_score:.4f} + underlying={underlying_bonus:.4f} "
+                f"[fund={underlying_breakdown['fundamentals_bonus']:.2f} rsi={underlying_breakdown['rsi_bonus']:.2f} "
+                f"iv={underlying_breakdown['iv_bonus']:.2f} mr={underlying_breakdown['mr_bonus']:.2f}]) | "
                 f"required_cash_net=${required_cash_net:,.2f}"
             )
 
@@ -1182,7 +1268,9 @@ def main() -> None:
             # Build metadata object as specified
             metadata = {
                 "contract_score": contract_score,
-                "total_score": total_score,  # Total score (contract_score + liquidity_bonus)
+                "total_score": total_score,  # Total score (contract_score + liquidity_bonus + underlying_bonus)
+                "underlying_bonus": underlying_bonus,
+                "underlying_breakdown": underlying_breakdown,
                 "score_components": {
                     "annualized_yield": ann_yld,  # yield
                     "spread_pct": spread_pct,
@@ -1272,6 +1360,8 @@ def main() -> None:
                         "contract_score": contract_score,
                         "total_score": total_score,
                         "liquidity_bonus": liquidity_bonus,
+                        "underlying_bonus": underlying_bonus,
+                        "underlying_breakdown": underlying_breakdown,
                         "openInterest": best.get("openInterest"),
                         "volume": best.get("totalVolume") or best.get("volume"),
                         "inTheMoney": best.get("inTheMoney"),
