@@ -217,8 +217,8 @@ def compute_underlying_bonus(c: Dict[str, Any]) -> Tuple[float, Dict[str, float]
         # iv_bonus = (iv_rank / 100) * 10
         breakdown["iv_bonus"] = (iv_rank / 100.0) * 10.0
     elif iv_current is not None:
-        # Tiny bonus until rank history exists
-        breakdown["iv_bonus"] = 2.0
+        # Minimal bonus until rank history exists (reduced from 2.0 to 0.5)
+        breakdown["iv_bonus"] = 0.5
     else:
         breakdown["iv_bonus"] = 0.0
     
