@@ -46,6 +46,10 @@ WHEEL_CSP_MAX_CASH_PER_TRADE = float(os.getenv("WHEEL_CSP_MAX_CASH_PER_TRADE", "
 WHEEL_CASH_EQUIVALENT_SYMBOLS = os.getenv("WHEEL_CASH_EQUIVALENT_SYMBOLS", "SWVXX").strip()
 DEFAULT_PORTFOLIO_CASH = 50000.0  # Fallback if Schwab fetch fails
 
+# Portfolio selection quality floor
+WHEEL_MIN_TOTAL_SCORE = float(os.getenv("WHEEL_MIN_TOTAL_SCORE", "0.0"))
+WHEEL_ALLOW_NEGATIVE_SELECTION = os.getenv("WHEEL_ALLOW_NEGATIVE_SELECTION", "false").lower() in ("true", "1", "yes")
+
 # Scoring mode: "balanced" (default) or "quality_first"
 SCORE_MODE = os.getenv("WHEEL_SCORE_MODE", "balanced").lower()
 if SCORE_MODE not in ("balanced", "quality_first"):
@@ -966,6 +970,9 @@ def main() -> None:
     rules = load_wheel_rules()
     logger.info(f"Scoring mode: {SCORE_MODE}")
     logger.info(
+        f"Selection rule: min_total_score={WHEEL_MIN_TOTAL_SCORE:.2f}, allow_negative_selection={WHEEL_ALLOW_NEGATIVE_SELECTION}"
+    )
+    logger.info(
         f"Wheel rules in effect: "
         f"CSP delta=[{rules.csp_delta_min:.2f}, {rules.csp_delta_max:.2f}], "
         f"DTE primary=[{rules.dte_min_primary}, {rules.dte_max_primary}], "
@@ -1673,12 +1680,26 @@ def main() -> None:
     # Sort by total_score descending (best first)
     picks_with_scores.sort(key=lambda x: x[1], reverse=True)
     
+    # Apply quality floor filter (unless explicitly overridden)
+    if WHEEL_ALLOW_NEGATIVE_SELECTION:
+        eligible_for_selection = picks_with_scores
+    else:
+        eligible_for_selection = [
+            (idx, total_score, required_cash_net)
+            for idx, total_score, required_cash_net in picks_with_scores
+            if total_score >= WHEEL_MIN_TOTAL_SCORE
+        ]
+    
+    total_candidates = len(pick_rows)
+    eligible_by_score = len(eligible_for_selection)
+    skipped_due_to_score_floor = total_candidates - eligible_by_score
+    
     selected_indices = set()
     running_allocated_net = 0.0
     selection_rank = 0
     skipped_portfolio_trade_too_large = 0
     
-    for idx, total_score, required_cash_net in picks_with_scores:
+    for idx, total_score, required_cash_net in eligible_for_selection:
         # Check if we've hit max trades limit
         if len(selected_indices) >= WHEEL_CSP_MAX_TRADES:
             break
@@ -1739,10 +1760,18 @@ def main() -> None:
     selected_count = len(selected_indices)
     logger.info(
         f"Portfolio selection: {selected_count}/{len(pick_rows)} picks selected, "
+        f"total_candidates={total_candidates}, eligible_by_score={eligible_by_score}, "
+        f"skipped_due_to_score_floor={skipped_due_to_score_floor}, "
         f"allocated=${running_allocated_net:,.2f} / ${allocatable_cash:,.2f} allocatable "
         f"(${effective_budget_cash:,.2f} budget with {cash_buffer_pct:.1%} buffer), "
         f"skipped_trade_too_large={skipped_portfolio_trade_too_large}"
     )
+    
+    if eligible_by_score == 0 and not WHEEL_ALLOW_NEGATIVE_SELECTION:
+        logger.warning(
+            f"No picks meet min_total_score threshold ({WHEEL_MIN_TOTAL_SCORE:.2f}); selected=0. "
+            f"Set WHEEL_ALLOW_NEGATIVE_SELECTION=true to override."
+        )
 
     # 3) Delete existing CSP picks for this run_id, then insert new ones
     # (This ensures idempotent reruns)
