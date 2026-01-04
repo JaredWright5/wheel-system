@@ -119,6 +119,9 @@ def build_why_this_trade(*, symbol: str, pick: dict, metrics: dict, rules: Any) 
     earn_in_days = pick.get("earn_in_days")
     earnings_avoid_days = rule_context.get("earnings_avoid_days", rules.earnings_avoid_days)
     
+    # Extract total_score for headline (need it earlier)
+    total_score = metadata.get("total_score") or metadata.get("chosen_total_score", 0.0)
+    
     # Extract liquidity flags
     liquidity = metadata.get("liquidity", {})
     min_bid_ok = liquidity.get("min_bid_ok", False)
@@ -130,8 +133,28 @@ def build_why_this_trade(*, symbol: str, pick: dict, metrics: dict, rules: Any) 
     piotroski_score = financial_scores.get("piotroskiScore")
     altman_z_score = financial_scores.get("altmanZScore")
     
-    # Build headline
-    headline = f"CSP {symbol} ${strike:.2f} {dte}DTE: {ann_yld:.1%} yield, delta={abs_delta:.2f}"
+    # Build headline (quality-first: score + safety first, yield last)
+    # Format: "CSP {ticker} ${strike:.2f} ({dte}DTE, Δ={abs_delta:.2f}) — total_score={total_score:+.2f} | fund={fund_score:.0f} | {earnings_phrase} | {yield_pct:.1f}% ann"
+    
+    # Default values for headline components
+    fund_score_for_headline = fund_score if fund_score is not None else 50.0
+    abs_delta_for_headline = abs_delta if abs_delta is not None else 0.0
+    yield_pct = (ann_yld * 100.0) if ann_yld is not None else 0.0
+    
+    # Build earnings phrase
+    if earn_in_days is not None:
+        try:
+            earn_days_int = int(earn_in_days)
+            if earn_days_int <= earnings_avoid_days:
+                earnings_phrase = "earnings blocked"
+            else:
+                earnings_phrase = f"earnings {earn_days_int}d away"
+        except (ValueError, TypeError):
+            earnings_phrase = "earnings unknown"
+    else:
+        earnings_phrase = "earnings unknown"
+    
+    headline = f"CSP {symbol} ${strike:.2f} ({dte}DTE, Δ={abs_delta_for_headline:.2f}) — total_score={total_score:+.2f} | fund={fund_score_for_headline:.0f} | {earnings_phrase} | {yield_pct:.1f}% ann"
     
     # Build bullets
     bullets = []
