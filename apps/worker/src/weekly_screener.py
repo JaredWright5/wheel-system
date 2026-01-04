@@ -380,124 +380,119 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
-def get_iv_from_snapshots(
-    ticker: str,
+def batch_fetch_iv_snapshots(
+    symbols: List[str],
     lookback_days: int = 252,
-) -> Optional[Dict[str, Any]]:
+    min_points: int = 20,
+) -> Dict[str, Dict[str, Any]]:
     """
-    Fetch latest IV snapshot and historical IV series for a ticker.
+    Batch fetch IV snapshots for all symbols, then compute metrics per symbol.
     
     Args:
-        ticker: Stock symbol
+        symbols: List of stock symbols
         lookback_days: Number of days to look back for historical series (default 252)
+        min_points: Minimum number of data points required for rank/percentile/zscore (default 20)
         
     Returns:
-        Dict with IV metrics:
-        {
-            "current": float or None,
-            "rank": float or None (0-100),
-            "percentile": float or None (0-100),
-            "zscore": float or None,
-            "asof_date": "YYYY-MM-DD" or None,
-            "exp_date": "YYYY-MM-DD" or None,
-            "dte": int or None,
-            "atm_strike": float or None
-        }
-        Returns None if no IV data found
+        Dictionary mapping symbol -> IV metrics dict (same format as get_iv_from_snapshots)
     """
+    result: Dict[str, Dict[str, Any]] = {}
+    
+    if not symbols:
+        return result
+    
     try:
         sb = get_supabase()
-        
-        # Get latest snapshot
-        latest_res = sb.table("iv_snapshots").select("*").eq("symbol", ticker).order("asof_date", desc=True).limit(1).execute()
-        
-        if not latest_res.data or len(latest_res.data) == 0:
-            return None
-        
-        latest = latest_res.data[0]
-        iv_current = _safe_float(latest.get("iv"))
-        asof_date = latest.get("asof_date")
-        exp_date = latest.get("exp_date")
-        dte = latest.get("dte")
-        atm_strike = _safe_float(latest.get("strike"))
-        
-        if iv_current is None:
-            return None
-        
-        # Get historical series for lookback window
         cutoff_date = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).date()
         
-        history_res = sb.table("iv_snapshots").select("iv, asof_date").eq("symbol", ticker).gte("asof_date", cutoff_date.isoformat()).order("asof_date", desc=False).execute()
+        # Fetch all IV snapshots for all symbols in lookback window (batched query)
+        # Supabase .in_() supports up to ~1000 items, so we chunk if needed
+        CHUNK_SIZE = 500
+        all_rows: List[Dict[str, Any]] = []
         
-        if not history_res.data or len(history_res.data) < 20:
-            # Too few data points for meaningful statistics
-            return {
+        for i in range(0, len(symbols), CHUNK_SIZE):
+            chunk_symbols = symbols[i:i + CHUNK_SIZE]
+            try:
+                res = sb.table("iv_snapshots").select("*").in_("symbol", chunk_symbols).gte("asof_date", cutoff_date.isoformat()).order("asof_date", desc=False).execute()
+                if res.data:
+                    all_rows.extend(res.data)
+            except Exception as e:
+                logger.warning(f"Error fetching IV snapshot chunk {i//CHUNK_SIZE + 1}: {e}")
+                continue
+        
+        # Group by symbol and compute metrics
+        by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        for row in all_rows:
+            symbol = row.get("symbol")
+            if symbol:
+                if symbol not in by_symbol:
+                    by_symbol[symbol] = []
+                by_symbol[symbol].append(row)
+        
+        # For each symbol, find latest snapshot and compute metrics
+        for symbol in symbols:
+            rows = by_symbol.get(symbol, [])
+            if not rows:
+                continue
+            
+            # Find latest snapshot (most recent asof_date)
+            latest = max(rows, key=lambda r: r.get("asof_date", ""))
+            iv_current = _safe_float(latest.get("iv"))
+            
+            if iv_current is None or iv_current <= 0:
+                continue
+            
+            asof_date = latest.get("asof_date")
+            exp_date = latest.get("exp_date")
+            dte = latest.get("dte")
+            atm_strike = _safe_float(latest.get("strike"))
+            
+            # Extract IV series (all valid IV values in lookback window)
+            iv_series = []
+            for row in rows:
+                iv_val = _safe_float(row.get("iv"))
+                if iv_val is not None and iv_val > 0:
+                    iv_series.append(iv_val)
+            
+            # Compute metrics if we have enough data points
+            iv_rank = None
+            iv_percentile = None
+            iv_zscore = None
+            
+            if len(iv_series) >= min_points:
+                iv_min = min(iv_series)
+                iv_max = max(iv_series)
+                iv_mean = statistics.mean(iv_series)
+                iv_std = statistics.stdev(iv_series) if len(iv_series) > 1 else 0.0
+                
+                # IV Rank: (current - min) / (max - min) * 100
+                if iv_max > iv_min:
+                    iv_rank = ((iv_current - iv_min) / (iv_max - iv_min)) * 100.0
+                    iv_rank = max(0.0, min(100.0, iv_rank))  # Clamp to [0, 100]
+                
+                # IV Percentile: percentile rank of current within series
+                below_count = sum(1 for v in iv_series if v < iv_current)
+                iv_percentile = (below_count / len(iv_series)) * 100.0
+                
+                # IV Z-Score: (current - mean) / std
+                if iv_std > 0:
+                    iv_zscore = (iv_current - iv_mean) / iv_std
+            
+            result[symbol] = {
                 "current": iv_current,
-                "rank": None,
-                "percentile": None,
-                "zscore": None,
+                "rank": iv_rank,
+                "percentile": iv_percentile,
+                "zscore": iv_zscore,
                 "asof_date": asof_date,
                 "exp_date": exp_date,
                 "dte": dte,
                 "atm_strike": atm_strike,
             }
-        
-        # Extract IV values from history
-        iv_series = []
-        for row in history_res.data:
-            iv_val = _safe_float(row.get("iv"))
-            if iv_val is not None and iv_val > 0:
-                iv_series.append(iv_val)
-        
-        if len(iv_series) < 20:
-            return {
-                "current": iv_current,
-                "rank": None,
-                "percentile": None,
-                "zscore": None,
-                "asof_date": asof_date,
-                "exp_date": exp_date,
-                "dte": dte,
-                "atm_strike": atm_strike,
-            }
-        
-        # Compute statistics
-        iv_min = min(iv_series)
-        iv_max = max(iv_series)
-        iv_mean = statistics.mean(iv_series)
-        iv_std = statistics.stdev(iv_series) if len(iv_series) > 1 else 0.0
-        
-        # IV Rank: (current - min) / (max - min) * 100
-        iv_rank = None
-        if iv_max > iv_min:
-            iv_rank = ((iv_current - iv_min) / (iv_max - iv_min)) * 100.0
-            iv_rank = max(0.0, min(100.0, iv_rank))  # Clamp to [0, 100]
-        
-        # IV Percentile: percentile rank of current within series
-        iv_percentile = None
-        if len(iv_series) > 0:
-            below_count = sum(1 for v in iv_series if v < iv_current)
-            iv_percentile = (below_count / len(iv_series)) * 100.0
-        
-        # IV Z-Score: (current - mean) / std
-        iv_zscore = None
-        if iv_std > 0:
-            iv_zscore = (iv_current - iv_mean) / iv_std
-        
-        return {
-            "current": iv_current,
-            "rank": iv_rank,
-            "percentile": iv_percentile,
-            "zscore": iv_zscore,
-            "asof_date": asof_date,
-            "exp_date": exp_date,
-            "dte": dte,
-            "atm_strike": atm_strike,
-        }
         
     except Exception as e:
-        logger.debug(f"Error fetching IV from snapshots for {ticker}: {e}")
-        return None
+        logger.warning(f"Error in batch_fetch_iv_snapshots: {e}")
+    
+    return result
 
 
 def score_volatility_regime(iv_data: Optional[Dict[str, Any]]) -> float:
@@ -848,28 +843,53 @@ def get_rsi_from_cache(
         return None
 
 
-def score_technical(rsi: Optional[float]) -> int:
+def score_technical(rsi: Optional[float], iv_data: Optional[Dict[str, Any]] = None) -> int:
     """
-    Score based on RSI (technical sanity).
+    Score based on RSI (technical sanity) with IV volatility bonus integrated.
     Prefer RSI in reasonable range (30-70).
-    Missing RSI is treated as neutral (50 points).
+    Missing RSI is treated as neutral (50 points base).
+    IV bonus adds 0-10 points based on IV rank, or 2 points if IV present but rank unavailable.
     
+    Args:
+        rsi: RSI value (float or None)
+        iv_data: IV metrics dict with "rank" and "current" keys (optional)
+        
     Returns:
-        Score 0-100 (100 = ideal RSI, 50 = neutral/missing, 0 = extreme)
+        Score 0-100 (100 = ideal RSI + high IV rank, 50 = neutral/missing, 0 = extreme)
     """
+    # Base RSI score (0-100, defaults to 50 if missing)
     if rsi is None:
-        return 50  # Neutral if missing (soft score, no penalty)
-    
-    # Ideal range: 30-70 (score = 100)
-    # Outside range: score decreases
-    if 30 <= rsi <= 70:
-        return 100
-    elif rsi < 30:
-        # Oversold: score decreases linearly from 100 at 30 to 0 at 0
-        return clamp_int(100 * (rsi / 30.0), 0, 100)
+        base_score = 50  # Neutral if missing (soft score, no penalty)
     else:
-        # Overbought: score decreases linearly from 100 at 70 to 0 at 100
-        return clamp_int(100 * ((100 - rsi) / 30.0), 0, 100)
+        # Ideal range: 30-70 (score = 100)
+        # Outside range: score decreases
+        if 30 <= rsi <= 70:
+            base_score = 100
+        elif rsi < 30:
+            # Oversold: score decreases linearly from 100 at 30 to 0 at 0
+            base_score = clamp_int(100 * (rsi / 30.0), 0, 100)
+        else:
+            # Overbought: score decreases linearly from 100 at 70 to 0 at 100
+            base_score = clamp_int(100 * ((100 - rsi) / 30.0), 0, 100)
+    
+    # Add IV bonus (0-10 points) as part of technical score
+    iv_bonus = 0.0
+    if iv_data is not None:
+        iv_rank = iv_data.get("rank")
+        iv_current = iv_data.get("current")
+        
+        if iv_rank is not None:
+            # IV Rank bonus: 0-10 points (higher rank => higher bonus)
+            iv_bonus = (iv_rank / 100.0) * 10.0
+        elif iv_current is not None:
+            # Small "IV present" credit if rank unavailable
+            iv_bonus = 2.0
+    
+    # Combine: base_score is 0-100, iv_bonus is 0-10, result should be 0-100
+    # Scale iv_bonus to fit within the 0-100 range (add directly, cap at 100)
+    final_score = clamp_int(base_score + iv_bonus, 0, 100)
+    
+    return final_score
 
 
 def main() -> None:
@@ -900,6 +920,7 @@ def main() -> None:
         MIN_AVG_VOLUME = int(os.getenv("MIN_AVG_VOLUME", "1000000")) if os.getenv("MIN_AVG_VOLUME") else None
         RSI_MAX_AGE_HOURS = int(os.getenv("RSI_MAX_AGE_HOURS", "24"))
         IV_LOOKBACK_DAYS = int(os.getenv("WHEEL_IV_LOOKBACK_DAYS", "252"))
+        IV_MIN_POINTS = int(os.getenv("WHEEL_IV_MIN_POINTS", "20"))
         
         # Build universe
         if universe_source == "csv":
@@ -917,6 +938,15 @@ def main() -> None:
         
         logger.info(f"Fetching earnings calendar for date range: {start_date.isoformat()} to {end_date.isoformat()}")
         earnings_map = fetch_earnings_calendar_range(fmp, start_date, end_date, universe_symbols)
+        
+        # Batch fetch IV snapshots for all symbols
+        logger.info(f"Batch fetching IV snapshots for {len(universe)} symbols (lookback_days={IV_LOOKBACK_DAYS}, min_points={IV_MIN_POINTS})")
+        iv_cache = batch_fetch_iv_snapshots(
+            list(universe_symbols),
+            lookback_days=IV_LOOKBACK_DAYS,
+            min_points=IV_MIN_POINTS
+        )
+        logger.info(f"IV snapshots fetched for {len(iv_cache)} symbols")
         
         # Insert run row with status='running'
         run_row = insert_row("screening_runs", {
@@ -1038,8 +1068,8 @@ def main() -> None:
                 
                 rsi = rsi_value
                 
-                # Fetch IV data from snapshots
-                iv_data = get_iv_from_snapshots(t, lookback_days=IV_LOOKBACK_DAYS)
+                # Get IV data from batch cache
+                iv_data = iv_cache.get(t)
                 if iv_data is None or iv_data.get("current") is None:
                     iv_missing += 1
                 else:
@@ -1101,21 +1131,17 @@ def main() -> None:
                 f_score, f_breakdown = score_fundamentals(ratios, metrics, financial_scores_data, financial_growth_data)
                 fundamentals_scores.append(f_score)
                 trend_score, t_feats = score_trend_proxy(quote)
-                tech_score = score_technical(rsi_value)  # RSI contributes as soft score (10% weight)
-                
-                # Compute volatility regime bonus from IV
-                iv_bonus = score_volatility_regime(iv_data)
+                tech_score = score_technical(rsi_value, iv_data=iv_data)  # RSI + IV bonus integrated (10% weight)
                 
                 # Composite wheel score (weighted) - same top-level weights
-                # Add IV bonus as part of trend/technical component (small modifier)
-                base_score = (
+                # IV bonus is now integrated into tech_score
+                wheel_score = clamp_int(
                     0.50 * f_score +      # Fundamentals: 50%
                     0.20 * sent_score +   # Sentiment: 20%
                     0.20 * trend_score +  # Trend: 20%
-                    0.10 * tech_score     # Technical (RSI): 10% - soft score, missing RSI = neutral
+                    0.10 * tech_score,    # Technical (RSI + IV): 10% - soft score, missing RSI/IV = neutral
+                    0, 100
                 )
-                # Add IV bonus (0-15 points, scaled to 0-1.5% of total score)
-                wheel_score = clamp_int(base_score + (iv_bonus / 100.0) * 1.5, 0, 100)
                 
                 # Extract company info
                 name = profile.get("companyName") or profile.get("name") or item.get("name") or t
@@ -1131,6 +1157,7 @@ def main() -> None:
                     "rsi_missing": rsi is None,
                     "iv_missing": iv_data is None or iv_data.get("current") is None,
                     "iv_lookback_days": IV_LOOKBACK_DAYS,
+                    "iv_min_points": IV_MIN_POINTS,
                     "notes": "IV sourced from Schwab option chain snapshots; weekly_screener does not require IV to run"
                 }
                 
@@ -1166,7 +1193,6 @@ def main() -> None:
                     "sentiment_raw": sent,
                     "fundamentals_breakdown": f_breakdown,  # Store breakdown in features
                     "trend": t_feats,
-                    "iv_bonus": iv_bonus,  # Store IV bonus for transparency
                 }
                 
                 candidates.append(Candidate(
@@ -1229,11 +1255,13 @@ def main() -> None:
             f"(empty={rsi_empty}, http_error={rsi_http_error}, blocked_402={rsi_blocked_402}, parse_error={rsi_parse_error})"
         )
         
-        # Log IV coverage statistics
+        # Log IV enrichment statistics
+        iv_current_known = passed_all_filters - iv_missing
+        iv_rank_unknown = iv_current_known - iv_rank_available
         logger.info(
-            f"IV coverage: iv_missing={iv_missing}, iv_rank_available={iv_rank_available}, "
-            f"iv_percentile_available={iv_percentile_available}, iv_zscore_available={iv_zscore_available}, "
-            f"lookback_days={IV_LOOKBACK_DAYS}"
+            f"IV enrichment: iv_current_known={iv_current_known} unknown={iv_missing}; "
+            f"iv_rank_known={iv_rank_available} unknown={iv_rank_unknown} "
+            f"(min_points={IV_MIN_POINTS}, lookback_days={IV_LOOKBACK_DAYS})"
         )
         
         # Log fundamentals score distribution
@@ -1287,7 +1315,6 @@ def main() -> None:
                 "rsi": c.features.get("rsi"),  # Stored as {"value": float|None, "period": int, "interval": str}
                 "iv": iv_data,  # Stored as {"current": float|None, "rank": float|None, "percentile": float|None, "zscore": float|None, ...}
                 "sentiment": c.features.get("sentiment_raw"),
-                "iv_bonus": c.features.get("iv_bonus", 0.0),
             }
             
             # Build row - try explicit columns first, fallback to metadata JSON
