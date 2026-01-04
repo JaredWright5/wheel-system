@@ -1400,20 +1400,20 @@ def main() -> None:
             required_cash_net = required_cash - (bid * 100.0)  # Net cash after premium received
 
             # Log successful pick with total_score breakdown
-                if SCORE_MODE == "quality_first":
-                    fund_comp = score_components.get("fundamentals_component", 0.0)
-                    contract_comp = score_components.get("contract_component", 0.0)
-                    tacticals_comp = score_components.get("tacticals_component", 0.0)
-                    fund_score_display = f"{fund_score:.1f}" if fund_score is not None else "NA"
-                    logger.info(
-                        f"{ticker}: pick created | window={window_used} | "
-                        f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
-                        f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
-                        f"total_score={total_score:.4f} | "
-                        f"fund_score={fund_score_display} | "
-                        f"components: fund={fund_comp:.2f} contract={contract_comp:.4f} tacticals={tacticals_comp:.2f} | "
-                        f"required_cash_net=${required_cash_net:,.2f}"
-                    )
+            if SCORE_MODE == "quality_first":
+                fund_comp = score_components.get("fundamentals_component", 0.0)
+                contract_comp = score_components.get("contract_component", 0.0)
+                tacticals_comp = score_components.get("tacticals_component", 0.0)
+                fund_score_display = f"{fund_score:.1f}" if fund_score is not None else "NA"
+                logger.info(
+                    f"{ticker}: pick created | window={window_used} | "
+                    f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
+                    f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
+                    f"total_score={total_score:.4f} | "
+                    f"fund_score={fund_score_display} | "
+                    f"components: fund={fund_comp:.2f} contract={contract_comp:.4f} tacticals={tacticals_comp:.2f} | "
+                    f"required_cash_net=${required_cash_net:,.2f}"
+                )
             else:
                 logger.info(
                     f"{ticker}: pick created | window={window_used} | "
