@@ -169,7 +169,7 @@ def compute_underlying_bonus(c: Dict[str, Any]) -> Tuple[float, Dict[str, float]
     Returns:
         (underlying_bonus, breakdown_dict)
         - underlying_bonus: bounded bonus (-10 to +25)
-        - breakdown_dict: {"fundamentals_bonus": float, "rsi_bonus": float, "iv_bonus": float, "mr_bonus": float}
+        - breakdown_dict: {"fundamentals_bonus": float, "rsi_bonus": float, "iv_bonus": float, "mr_bonus": float, "fundamentals_penalty": float}
     """
     metrics = c.get("metrics") or {}
     breakdown = {
@@ -177,17 +177,34 @@ def compute_underlying_bonus(c: Dict[str, Any]) -> Tuple[float, Dict[str, float]
         "rsi_bonus": 0.0,
         "iv_bonus": 0.0,
         "mr_bonus": 0.0,
+        "fundamentals_penalty": 0.0,
     }
     
+    # Extract fund_score (treat None as 50 for penalty calculation)
+    fund_score_raw = metrics.get("fundamentals_score") or metrics.get("fundamentals_score_total")
+    fund_score = _safe_float(fund_score_raw, 50.0) if fund_score_raw is not None else 50.0
+    
     # 1) Fundamentals bonus (0 to +15)
-    # Read fundamentals_score_total from metrics
-    fund_score = metrics.get("fundamentals_score") or metrics.get("fundamentals_score_total")
-    if fund_score is not None:
-        fund_score_float = _safe_float(fund_score, 50.0)
+    if fund_score_raw is not None:
+        fund_score_float = _safe_float(fund_score_raw, 50.0)
         # fundamentals_bonus = clamp((fund_score - 50) / 50, 0, 1) * 15
         # So 50 => 0, 100 => +15
         normalized = max(0.0, min(1.0, (fund_score_float - 50.0) / 50.0))
         breakdown["fundamentals_bonus"] = normalized * 15.0
+    
+    # 1b) Fundamentals penalty (soft penalty for low quality)
+    # if fund_score >= 60: penalty = 0
+    # if 55 <= fund_score < 60: penalty = -2
+    # if 45 <= fund_score < 55: penalty = -6
+    # if fund_score < 45: penalty = -12
+    if fund_score >= 60:
+        breakdown["fundamentals_penalty"] = 0.0
+    elif fund_score >= 55:
+        breakdown["fundamentals_penalty"] = -2.0
+    elif fund_score >= 45:
+        breakdown["fundamentals_penalty"] = -6.0
+    else:
+        breakdown["fundamentals_penalty"] = -12.0
     
     # 2) RSI mean reversion bonus (-5 to +5)
     rsi_data = metrics.get("rsi") or {}
@@ -230,7 +247,14 @@ def compute_underlying_bonus(c: Dict[str, Any]) -> Tuple[float, Dict[str, float]
         breakdown["mr_bonus"] = 0.0
     
     # Total bonus: cap at +25, floor at -10
-    total_bonus = sum(breakdown.values())
+    # Include fundamentals_penalty in the sum
+    total_bonus = (
+        breakdown["fundamentals_bonus"] +
+        breakdown["rsi_bonus"] +
+        breakdown["iv_bonus"] +
+        breakdown["mr_bonus"] +
+        breakdown["fundamentals_penalty"]
+    )
     underlying_bonus = max(-10.0, min(25.0, total_bonus))
     
     return underlying_bonus, breakdown
@@ -1421,7 +1445,7 @@ def main() -> None:
                     f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
                     f"total_score={total_score:.4f} (contract={contract_score:.4f} + underlying={underlying_bonus:.4f} "
                     f"[fund={underlying_breakdown['fundamentals_bonus']:.2f} rsi={underlying_breakdown['rsi_bonus']:.2f} "
-                    f"iv={underlying_breakdown['iv_bonus']:.2f} mr={underlying_breakdown['mr_bonus']:.2f}]) | "
+                    f"iv={underlying_breakdown['iv_bonus']:.2f} mr={underlying_breakdown['mr_bonus']:.2f} pen={underlying_breakdown.get('fundamentals_penalty', 0.0):.2f}]) | "
                     f"required_cash_net=${required_cash_net:,.2f}"
                 )
 
