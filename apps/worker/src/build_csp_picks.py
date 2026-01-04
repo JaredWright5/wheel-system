@@ -2196,6 +2196,24 @@ def main() -> None:
 
     # 5) Insert new picks (batch insert)
     logger.info(f"Inserting {len(pick_rows)} screening_picks rows...")
+    
+    # Log pick_metrics structure for first pick to verify trade_card is present
+    if pick_rows:
+        first_pick = pick_rows[0]
+        pick_metrics = first_pick.get("pick_metrics", {})
+        if isinstance(pick_metrics, dict):
+            keys = list(pick_metrics.keys())
+            logger.info(f"pick_metrics keys: {keys}")
+            if "trade_card" not in keys:
+                logger.error("ERROR: 'trade_card' missing from pick_metrics keys!")
+            else:
+                trade_card = pick_metrics.get("trade_card", {})
+                if isinstance(trade_card, dict):
+                    trade_card_keys = list(trade_card.keys())
+                    logger.info(f"trade_card keys: {trade_card_keys}")
+                    if "why_this_trade" not in trade_card_keys:
+                        logger.error("ERROR: 'why_this_trade' missing from trade_card keys!")
+    
     insert_res = sb.table("screening_picks").insert(pick_rows).execute()
     
     # Check for errors
