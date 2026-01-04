@@ -1,110 +1,158 @@
 {% extends "base.html" %}
 
-{% block title %}Picks - Wheel System{% endblock %}
-
 {% block content %}
-<div class="page-header">
-    <h2>Trading Picks (Latest Run)</h2>
-</div>
-
-<div class="section">
-    <h3>Cash-Secured Puts (CSP)</h3>
-    {% if csp_error %}
-    <div class="error-message">
+<div class="container">
+    <h1>Trading Picks</h1>
+    
+    <!-- Mode Toggle -->
+    <div class="mode-toggle">
+        {% if mode == "best" %}
+        <a href="/picks?mode=all" class="btn">Show all CSP picks</a>
+        {% else %}
+        <a href="/picks?mode=best" class="btn">Show best CSP only</a>
+        {% endif %}
+    </div>
+    
+    <!-- CSP Picks Section -->
+    <section>
+        <h2>CSP Picks</h2>
+        {% if mode == "best" %}
+        <!-- Best CSP Trade Card -->
+        {% if csp_error %}
+        <div class="error-message">
+            <p>⚠️ Best CSP view not available. Please run migrations to create v_latest_run_best_csp_pick.</p>
+        </div>
+        {% elif not csp_picks %}
+        <div class="info-message">
+            <p>No best CSP trade found for latest run.</p>
+        </div>
+        {% else %}
+        {% set pick = csp_picks[0] %}
+        <div class="best-trade-card">
+            {% set best_trade = best_trade_card.get("best_trade", {}) %}
+            {% set why_this_trade = best_trade_card.get("why_this_trade", {}) %}
+            {% set headline = best_trade.get("headline") or why_this_trade.get("headline") or "CSP " + (pick.ticker or "N/A") + " $" + (pick.strike|string or "0.00") + " " + (pick.dte|string or "0") + "DTE" %}
+            
+            <div class="trade-headline">
+                <h3>{{ headline }}</h3>
+            </div>
+            
+            {% if why_this_trade.get("bullets") %}
+            <div class="trade-bullets">
+                <ul>
+                    {% for bullet in why_this_trade.bullets[:6] %}
+                    <li>{{ bullet }}</li>
+                    {% endfor %}
+                </ul>
+            </div>
+            {% endif %}
+            
+            <div class="trade-stats">
+                <table class="stats-table">
+                    <tr>
+                        <td><strong>Ticker:</strong></td>
+                        <td>{{ pick.ticker or "N/A" }}</td>
+                        <td><strong>Expiration:</strong></td>
+                        <td>{{ pick.expiration or "N/A" }}</td>
+                    </tr>
+                    <tr>
+                        <td><strong>DTE:</strong></td>
+                        <td>{{ pick.dte or "N/A" }}</td>
+                        <td><strong>Strike:</strong></td>
+                        <td>${{ "%.2f"|format(pick.strike) if pick.strike else "N/A" }}</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Premium:</strong></td>
+                        <td>${{ "%.2f"|format(pick.premium) if pick.premium else "N/A" }}</td>
+                        <td><strong>Delta:</strong></td>
+                        <td>{{ "%.3f"|format(pick.delta) if pick.delta is not none else "N/A" }}</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Annualized Yield:</strong></td>
+                        <td>{{ "%.2f"|format(pick.annualized_yield * 100) if pick.annualized_yield else "N/A" }}%</td>
+                        <td><strong>Total Score:</strong></td>
+                        <td>{{ "%.2f"|format(best_trade.total_score) if best_trade.get("total_score") is not none else (pick.score|string if pick.score is not none else "N/A") }}</td>
+                    </tr>
+                </table>
+            </div>
+        </div>
+        {% endif %}
+        {% else %}
+        <!-- All CSP Picks Table -->
+        {% if csp_error %}
         <p>⚠️ View not found; run migrations to create v_latest_run_csp_picks.</p>
-    </div>
-    {% elif csp_picks|length == 0 %}
-    <div class="info-message">
-        <p>No CSP picks found for the latest run.</p>
-    </div>
-    {% else %}
-    <div class="table-container">
-        <table>
+        {% elif not csp_picks %}
+        <p>No CSP picks found.</p>
+        {% else %}
+        <table class="data-table">
             <thead>
                 <tr>
                     <th>Ticker</th>
                     <th>Expiration</th>
                     <th>DTE</th>
-                    <th>Target Delta</th>
                     <th>Strike</th>
                     <th>Premium</th>
                     <th>Delta</th>
-                    <th>Yield (Annual)</th>
-                    <th>Price</th>
-                    <th>IV</th>
-                    <th>IV Rank</th>
+                    <th>Yield</th>
+                    <th>Score</th>
                 </tr>
             </thead>
             <tbody>
                 {% for pick in csp_picks %}
                 <tr>
-                    <td><strong>{{ pick.ticker }}</strong></td>
-                    <td>{{ pick.expiration if pick.expiration else '-' }}</td>
-                    <td>{{ pick.dte if pick.dte is not none else '-' }}</td>
-                    <td>{{ "%.2f"|format(pick.target_delta) if pick.target_delta is not none else '-' }}</td>
-                    <td>${{ "%.2f"|format(pick.strike) if pick.strike is not none else '-' }}</td>
-                    <td>${{ "%.2f"|format(pick.premium) if pick.premium is not none else '-' }}</td>
-                    <td>{{ "%.2f"|format(pick.delta) if pick.delta is not none else '-' }}</td>
-                    <td><strong>{{ "%.2f"|format(pick.annualized_yield) if pick.annualized_yield is not none else '-' }}%</strong></td>
-                    <td>${{ "%.2f"|format(pick.price) if pick.price is not none else '-' }}</td>
-                    <td>{{ "%.2f"|format(pick.iv) if pick.iv is not none else '-' }}</td>
-                    <td>{{ "%.1f"|format(pick.iv_rank) if pick.iv_rank is not none else '-' }}</td>
+                    <td>{{ pick.ticker or "N/A" }}</td>
+                    <td>{{ pick.expiration or "N/A" }}</td>
+                    <td>{{ pick.dte or "N/A" }}</td>
+                    <td>${{ "%.2f"|format(pick.strike) if pick.strike else "N/A" }}</td>
+                    <td>${{ "%.2f"|format(pick.premium) if pick.premium else "N/A" }}</td>
+                    <td>{{ "%.3f"|format(pick.delta) if pick.delta is not none else "N/A" }}</td>
+                    <td>{{ "%.2f"|format(pick.annualized_yield * 100) if pick.annualized_yield else "N/A" }}%</td>
+                    <td>{{ "%.2f"|format(pick.score) if pick.score is not none else "N/A" }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
-    </div>
-    {% endif %}
-</div>
-
-<div class="section">
-    <h3>Covered Calls (CC)</h3>
-    {% if cc_error %}
-    <div class="error-message">
+        {% endif %}
+        {% endif %}
+    </section>
+    
+    <!-- CC Picks Section -->
+    <section>
+        <h2>CC Picks</h2>
+        {% if cc_error %}
         <p>⚠️ View not found; run migrations to create v_latest_run_cc_picks.</p>
-    </div>
-    {% elif cc_picks|length == 0 %}
-    <div class="info-message">
-        <p>No CC picks found for the latest run.</p>
-    </div>
-    {% else %}
-    <div class="table-container">
-        <table>
+        {% elif not cc_picks %}
+        <p>No CC picks found.</p>
+        {% else %}
+        <table class="data-table">
             <thead>
                 <tr>
                     <th>Ticker</th>
                     <th>Expiration</th>
                     <th>DTE</th>
-                    <th>Target Delta</th>
                     <th>Strike</th>
                     <th>Premium</th>
                     <th>Delta</th>
-                    <th>Yield (Annual)</th>
-                    <th>Price</th>
-                    <th>IV</th>
-                    <th>IV Rank</th>
+                    <th>Yield</th>
+                    <th>Score</th>
                 </tr>
             </thead>
             <tbody>
                 {% for pick in cc_picks %}
                 <tr>
-                    <td><strong>{{ pick.ticker }}</strong></td>
-                    <td>{{ pick.expiration if pick.expiration else '-' }}</td>
-                    <td>{{ pick.dte if pick.dte is not none else '-' }}</td>
-                    <td>{{ "%.2f"|format(pick.target_delta) if pick.target_delta is not none else '-' }}</td>
-                    <td>${{ "%.2f"|format(pick.strike) if pick.strike is not none else '-' }}</td>
-                    <td>${{ "%.2f"|format(pick.premium) if pick.premium is not none else '-' }}</td>
-                    <td>{{ "%.2f"|format(pick.delta) if pick.delta is not none else '-' }}</td>
-                    <td><strong>{{ "%.2f"|format(pick.annualized_yield) if pick.annualized_yield is not none else '-' }}%</strong></td>
-                    <td>${{ "%.2f"|format(pick.price) if pick.price is not none else '-' }}</td>
-                    <td>{{ "%.2f"|format(pick.iv) if pick.iv is not none else '-' }}</td>
-                    <td>{{ "%.1f"|format(pick.iv_rank) if pick.iv_rank is not none else '-' }}</td>
+                    <td>{{ pick.ticker or "N/A" }}</td>
+                    <td>{{ pick.expiration or "N/A" }}</td>
+                    <td>{{ pick.dte or "N/A" }}</td>
+                    <td>${{ "%.2f"|format(pick.strike) if pick.strike else "N/A" }}</td>
+                    <td>${{ "%.2f"|format(pick.premium) if pick.premium else "N/A" }}</td>
+                    <td>{{ "%.3f"|format(pick.delta) if pick.delta is not none else "N/A" }}</td>
+                    <td>{{ "%.2f"|format(pick.annualized_yield * 100) if pick.annualized_yield else "N/A" }}%</td>
+                    <td>{{ "%.2f"|format(pick.score) if pick.score is not none else "N/A" }}</td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
-    </div>
-    {% endif %}
+        {% endif %}
+    </section>
 </div>
 {% endblock %}
-
