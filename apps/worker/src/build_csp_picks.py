@@ -125,6 +125,43 @@ def _safe_float(x, default=None):
         return default
 
 
+def _extract_fundamentals_score(metrics: dict) -> Optional[float]:
+    """
+    Returns fundamentals score in 0-100 range if present, else None.
+    Supports multiple historical key names to avoid breaking.
+    """
+    if not isinstance(metrics, dict):
+        return None
+    # Preferred keys (newest first)
+    for path in [
+        ("fundamentals", "score_total"),
+        ("fundamentals_score_total",),
+        ("fundamentals_score",),
+        ("financial_scores", "score"),
+        ("financial_scores", "value"),
+    ]:
+        cur = metrics
+        ok = True
+        for k in path:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                ok = False
+                break
+        if ok:
+            try:
+                v = float(cur)
+                # sanity clamp
+                if v < 0:
+                    v = 0.0
+                if v > 100:
+                    v = 100.0
+                return v
+            except Exception:
+                pass
+    return None
+
+
 def compute_underlying_bonus(c: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
     """
     Compute underlying bonus from candidate metrics (fundamentals, RSI, IV).
@@ -1058,6 +1095,10 @@ def main() -> None:
 
             # Compute underlying_bonus once per candidate (used in scoring and comparison)
             underlying_bonus, underlying_breakdown = compute_underlying_bonus(c)
+            
+            # Extract fund_score from candidate metrics (used in scoring)
+            candidate_metrics = c.get("metrics") or {}
+            fund_score = _extract_fundamentals_score(candidate_metrics)
 
             # Try primary window first
             best_primary, exp_primary, diag_primary = attempt_window(
@@ -1105,12 +1146,14 @@ def main() -> None:
                     oi_primary = _safe_float(best_primary.get("openInterest"), 0.0) or 0.0
                     liquidity_bonus_primary = max(0.0, (0.05 - spread_pct_primary) * 100.0)
                     contract_score_primary = _safe_float(best_primary.get("_contract_score"), 0.0) or 0.0
+                    # Use fund_score or 50.0 (neutral) if None for scoring
+                    fund_score_for_scoring = fund_score if fund_score is not None else 50.0
                     total_score_primary, _ = compute_total_score(
                         contract_score_primary,
                         liquidity_bonus_primary,
                         underlying_bonus,
                         underlying_breakdown,
-                        fund_score,
+                        fund_score_for_scoring,
                         SCORE_MODE,
                     )
                     
@@ -1127,7 +1170,7 @@ def main() -> None:
                         liquidity_bonus_fallback,
                         underlying_bonus,
                         underlying_breakdown,
-                        fund_score,
+                        fund_score_for_scoring,
                         SCORE_MODE,
                     )
                     
@@ -1341,12 +1384,14 @@ def main() -> None:
             
             # Compute total_score based on scoring mode
             # underlying_bonus and fund_score already computed above (before window selection)
+            # Use fund_score or 50.0 (neutral) if None for scoring
+            fund_score_for_scoring = fund_score if fund_score is not None else 50.0
             total_score, score_components = compute_total_score(
                 contract_score,
                 liquidity_bonus,
                 underlying_bonus,
                 underlying_breakdown,
-                fund_score,
+                fund_score_for_scoring,
                 SCORE_MODE,
             )
 
@@ -1355,19 +1400,20 @@ def main() -> None:
             required_cash_net = required_cash - (bid * 100.0)  # Net cash after premium received
 
             # Log successful pick with total_score breakdown
-            if SCORE_MODE == "quality_first":
-                fund_comp = score_components.get("fundamentals_component", 0.0)
-                contract_comp = score_components.get("contract_component", 0.0)
-                tacticals_comp = score_components.get("tacticals_component", 0.0)
-                logger.info(
-                    f"{ticker}: pick created | window={window_used} | "
-                    f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
-                    f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
-                    f"total_score={total_score:.4f} | "
-                    f"fund_score={fund_score or 0:.1f} | "
-                    f"components: fund={fund_comp:.2f} contract={contract_comp:.4f} tacticals={tacticals_comp:.2f} | "
-                    f"required_cash_net=${required_cash_net:,.2f}"
-                )
+                if SCORE_MODE == "quality_first":
+                    fund_comp = score_components.get("fundamentals_component", 0.0)
+                    contract_comp = score_components.get("contract_component", 0.0)
+                    tacticals_comp = score_components.get("tacticals_component", 0.0)
+                    fund_score_display = f"{fund_score:.1f}" if fund_score is not None else "NA"
+                    logger.info(
+                        f"{ticker}: pick created | window={window_used} | "
+                        f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
+                        f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
+                        f"total_score={total_score:.4f} | "
+                        f"fund_score={fund_score_display} | "
+                        f"components: fund={fund_comp:.2f} contract={contract_comp:.4f} tacticals={tacticals_comp:.2f} | "
+                        f"required_cash_net=${required_cash_net:,.2f}"
+                    )
             else:
                 logger.info(
                     f"{ticker}: pick created | window={window_used} | "
@@ -1380,6 +1426,7 @@ def main() -> None:
                 )
 
             # Get RSI period/interval from candidate metrics or use defaults
+            # candidate_metrics already defined above (when extracting fund_score)
             rsi_period = candidate_metrics.get("rsi_period") or rules.rsi_period
             rsi_interval = candidate_metrics.get("rsi_interval") or rules.rsi_interval
 
