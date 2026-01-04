@@ -326,6 +326,83 @@ def build_why_this_trade(*, symbol: str, pick: dict, metrics: dict, rules: Any) 
     }
 
 
+def select_best_pick(picks: list[dict], *, min_total_score: float, allow_negative: bool) -> int | None:
+    """
+    Select the best pick from a list of picks using deterministic criteria.
+    
+    Args:
+        picks: List of pick dicts (from pick_rows)
+        min_total_score: Minimum total_score threshold
+        allow_negative: If False, exclude picks with total_score < min_total_score
+        
+    Returns:
+        Index of best pick in picks list, or None if no eligible picks
+    """
+    if not picks:
+        return None
+    
+    eligible_indices = []
+    for idx, pick in enumerate(picks):
+        pick_metrics = pick.get("pick_metrics", {})
+        metadata = pick_metrics.get("metadata", {})
+        total_score = metadata.get("total_score") or metadata.get("chosen_total_score") or 0.0
+        
+        # Apply selection rule
+        if not allow_negative and total_score < min_total_score:
+            continue
+        
+        eligible_indices.append((idx, total_score, pick))
+    
+    if not eligible_indices:
+        return None
+    
+    # Sort by criteria (highest first for all):
+    # 1. total_score (primary)
+    # 2. fund_score (higher is better, default 50 if missing)
+    # 3. liquidity quality: lower spread_pct is better, then higher openInterest
+    # 4. annualized_yield (higher is better)
+    # 5. shorter DTE (lower is better)
+    
+    def get_sort_key(item):
+        idx, total_score, pick = item
+        pick_metrics = pick.get("pick_metrics", {})
+        metadata = pick_metrics.get("metadata", {})
+        option_selected = pick_metrics.get("option_selected", {})
+        
+        # Extract fund_score (default 50)
+        fund_score = metadata.get("fund_score")
+        if fund_score is None:
+            underlying_breakdown = option_selected.get("underlying_breakdown", {})
+            fund_score = underlying_breakdown.get("fundamentals_score", 50.0)
+        if fund_score is None:
+            fund_score = 50.0
+        
+        # Extract liquidity metrics
+        spread_pct = option_selected.get("spread_pct", 999.0)  # Higher = worse
+        open_interest = option_selected.get("openInterest", 0)
+        
+        # Extract annualized_yield
+        ann_yld = pick.get("annualized_yield", 0.0)
+        
+        # Extract DTE
+        dte = pick.get("dte", 999)  # Higher = worse (prefer shorter)
+        
+        # Return tuple for sorting (all higher is better except spread_pct and dte)
+        # Use negative for spread_pct and dte to make higher = worse
+        return (
+            total_score,           # Primary: highest first
+            fund_score,            # Tie-breaker 1: higher first
+            -spread_pct,           # Tie-breaker 2a: lower spread_pct first (negative)
+            open_interest,         # Tie-breaker 2b: higher OI first
+            ann_yld,               # Tie-breaker 3: higher yield first
+            -dte,                  # Tie-breaker 4: shorter DTE first (negative)
+        )
+    
+    eligible_indices.sort(key=get_sort_key, reverse=True)
+    best_idx, _, _ = eligible_indices[0]
+    return best_idx
+
+
 def normalize_exposure_symbol(symbol: str) -> str:
     """
     Normalize symbol to prevent duplicate economic exposure.
@@ -2210,7 +2287,7 @@ def main() -> None:
             logger.info(f"  └─ {fund_str} | {rsi_str} | {iv_str} ({iv_rank_str}) | {earn_str}")
         logger.info("=" * 80)
 
-    # 4) Delete existing CSP picks for this run_id, then insert new ones
+    # 5) Delete existing CSP picks for this run_id, then insert new ones
     # (This ensures idempotent reruns)
     logger.info(f"Deleting existing CSP picks for run_id={run_id}")
     delete_res = (
@@ -2221,7 +2298,7 @@ def main() -> None:
         .execute()
     )
 
-    # 5) Insert new picks (batch insert)
+    # 6) Insert new picks (batch insert)
     logger.info(f"Inserting {len(pick_rows)} screening_picks rows...")
     
     # Log pick_metrics structure for first pick to verify trade_card is present
