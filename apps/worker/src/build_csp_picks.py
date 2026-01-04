@@ -1755,7 +1755,8 @@ def main() -> None:
             # Add to seen set and accept the pick
             seen_exposure.add(exposure_key)
 
-            pick_rows.append({
+            # Build pick row
+            pick_row = {
                 "run_id": run_id,
                 "ticker": ticker,
                 "action": "CSP",
@@ -1813,7 +1814,24 @@ def main() -> None:
                         "dte": dte,
                     },
                 },
-            })
+            }
+            
+            # Build and attach WHY_THIS_TRADE explainer
+            # Initialize trade_card if it doesn't exist (will be populated later for selected picks)
+            if "trade_card" not in pick_row["pick_metrics"]:
+                pick_row["pick_metrics"]["trade_card"] = {}
+            
+            # Build explainer using candidate metrics
+            candidate_metrics = c.get("metrics", {}) if isinstance(c.get("metrics"), dict) else {}
+            why_this_trade = build_why_this_trade(
+                symbol=ticker,
+                pick=pick_row,
+                metrics=candidate_metrics,
+                rules=rules,
+            )
+            pick_row["pick_metrics"]["trade_card"]["why_this_trade"] = why_this_trade
+            
+            pick_rows.append(pick_row)
 
         except Exception as e:
             skipped_no_chain += 1
@@ -1844,8 +1862,32 @@ def main() -> None:
             f"Check chain parsing / auth / delta availability."
         )
         # Don't raise error - allow the run to complete with 0 picks for visibility
+        return
 
-    # Compute display_score (percentile rank of chosen_total_score) for each pick
+    # 2) Log WHY_THIS_TRADE explainers for all generated picks
+    logger.info("=" * 80)
+    logger.info("WHY_THIS_TRADE (Generated Picks):")
+    logger.info("=" * 80)
+    for pick in pick_rows:
+        ticker = pick.get("ticker", "UNKNOWN")
+        trade_card = pick.get("pick_metrics", {}).get("trade_card", {})
+        why_this_trade = trade_card.get("why_this_trade", {})
+        
+        if why_this_trade:
+            headline = why_this_trade.get("headline", f"{ticker}: No explainer available")
+            bullets = why_this_trade.get("bullets", [])
+            
+            logger.info(f"WHY_THIS_TRADE: {ticker} — {headline}")
+            # Log up to 6 bullets to keep logs readable
+            for bullet in bullets[:6]:
+                logger.info(f" - {bullet}")
+            if len(bullets) > 6:
+                logger.info(f" - ... and {len(bullets) - 6} more bullets")
+        else:
+            logger.warning(f"{ticker}: WHY_THIS_TRADE explainer missing")
+    logger.info("=" * 80)
+
+    # 3) Compute display_score (percentile rank of chosen_total_score) for each pick
     if pick_rows:
         # Extract chosen_total_score from metadata for each pick
         scores_with_indices = []
