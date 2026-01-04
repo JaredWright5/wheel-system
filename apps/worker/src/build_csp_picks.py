@@ -46,6 +46,12 @@ WHEEL_CSP_MAX_CASH_PER_TRADE = float(os.getenv("WHEEL_CSP_MAX_CASH_PER_TRADE", "
 WHEEL_CASH_EQUIVALENT_SYMBOLS = os.getenv("WHEEL_CASH_EQUIVALENT_SYMBOLS", "SWVXX").strip()
 DEFAULT_PORTFOLIO_CASH = 50000.0  # Fallback if Schwab fetch fails
 
+# Scoring mode: "balanced" (default) or "quality_first"
+SCORE_MODE = os.getenv("WHEEL_SCORE_MODE", "balanced").lower()
+if SCORE_MODE not in ("balanced", "quality_first"):
+    logger.warning(f"Invalid WHEEL_SCORE_MODE={SCORE_MODE}, using 'balanced'")
+    SCORE_MODE = "balanced"
+
 
 # ---------- Helpers ----------
 
@@ -191,6 +197,71 @@ def compute_underlying_bonus(c: Dict[str, Any]) -> Tuple[float, Dict[str, float]
     underlying_bonus = max(-10.0, min(25.0, total_bonus))
     
     return underlying_bonus, breakdown
+
+
+def compute_total_score(
+    contract_score: float,
+    liquidity_bonus: float,
+    underlying_bonus: float,
+    underlying_breakdown: Dict[str, float],
+    fund_score: Optional[float],
+    score_mode: str,
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Compute total_score based on scoring mode.
+    
+    Args:
+        contract_score: Option contract score (unchanged)
+        liquidity_bonus: Liquidity bonus (unchanged)
+        underlying_bonus: Underlying bonus (for balanced mode)
+        underlying_breakdown: Breakdown dict with fund/rsi/iv/mr bonuses
+        fund_score: Fundamentals score (0-100, for quality_first mode)
+        score_mode: "balanced" or "quality_first"
+        
+    Returns:
+        (total_score, components_dict)
+        components_dict includes: fundamentals_component, contract_component, tacticals_component (for quality_first)
+        or contract_score, liquidity_bonus, underlying_bonus (for balanced)
+    """
+    if score_mode == "quality_first":
+        # fundamentals_component = (fund_score - 50) * 0.8
+        # So 50->0, 80->+24, 100->+40, 30->-16
+        if fund_score is not None:
+            fundamentals_component = (fund_score - 50.0) * 0.8
+        else:
+            fundamentals_component = 0.0
+        
+        # contract_component = contract_score (unchanged)
+        contract_component = contract_score
+        
+        # tacticals_component = (rsi_bonus + iv_bonus + mr_bonus) capped at +10, floored at -5
+        tacticals_raw = (
+            underlying_breakdown.get("rsi_bonus", 0.0) +
+            underlying_breakdown.get("iv_bonus", 0.0) +
+            underlying_breakdown.get("mr_bonus", 0.0)
+        )
+        tacticals_component = max(-5.0, min(10.0, tacticals_raw))
+        
+        # total_score = 0.60 * fundamentals_component + 0.25 * contract_component + 0.15 * tacticals_component
+        total_score = (
+            0.60 * fundamentals_component +
+            0.25 * contract_component +
+            0.15 * tacticals_component
+        )
+        
+        return total_score, {
+            "fundamentals_component": fundamentals_component,
+            "contract_component": contract_component,
+            "tacticals_component": tacticals_component,
+        }
+    else:
+        # balanced mode (default): total_score = contract_score + liquidity_bonus + underlying_bonus
+        total_score = contract_score + liquidity_bonus + underlying_bonus
+        return total_score, {
+            "contract_score": contract_score,
+            "liquidity_bonus": liquidity_bonus,
+            "underlying_bonus": underlying_bonus,
+        }
 
 
 def _fetch_portfolio_budget_from_schwab() -> Tuple[float, str]:
@@ -832,6 +903,7 @@ def attempt_window(
 def main() -> None:
     # Load wheel rules
     rules = load_wheel_rules()
+    logger.info(f"Scoring mode: {SCORE_MODE}")
     logger.info(
         f"Wheel rules in effect: "
         f"CSP delta=[{rules.csp_delta_min:.2f}, {rules.csp_delta_max:.2f}], "
@@ -1033,7 +1105,14 @@ def main() -> None:
                     oi_primary = _safe_float(best_primary.get("openInterest"), 0.0) or 0.0
                     liquidity_bonus_primary = max(0.0, (0.05 - spread_pct_primary) * 100.0)
                     contract_score_primary = _safe_float(best_primary.get("_contract_score"), 0.0) or 0.0
-                    total_score_primary = contract_score_primary + liquidity_bonus_primary + underlying_bonus
+                    total_score_primary, _ = compute_total_score(
+                        contract_score_primary,
+                        liquidity_bonus_primary,
+                        underlying_bonus,
+                        underlying_breakdown,
+                        fund_score,
+                        SCORE_MODE,
+                    )
                     
                     # Extract fallback comparison data
                     strike_fallback = _safe_float(best_fallback.get("strike"))
@@ -1043,7 +1122,14 @@ def main() -> None:
                     oi_fallback = _safe_float(best_fallback.get("openInterest"), 0.0) or 0.0
                     liquidity_bonus_fallback = max(0.0, (0.05 - spread_pct_fallback) * 100.0)
                     contract_score_fallback = _safe_float(best_fallback.get("_contract_score"), 0.0) or 0.0
-                    total_score_fallback = contract_score_fallback + liquidity_bonus_fallback + underlying_bonus
+                    total_score_fallback, _ = compute_total_score(
+                        contract_score_fallback,
+                        liquidity_bonus_fallback,
+                        underlying_bonus,
+                        underlying_breakdown,
+                        fund_score,
+                        SCORE_MODE,
+                    )
                     
                     # Store comparison data (underlying_bonus computed above)
                     primary_comparison_data = {
@@ -1075,19 +1161,31 @@ def main() -> None:
                         exp = exp_fallback
                         window_used = "fallback"
                         selection_reason = "fallback_better_score"
-                        logger.info(
-                            f"{ticker}: fallback selected | "
-                            f"primary_total={total_score_primary:.4f} (contract={contract_score_primary:.4f} + liq={liquidity_bonus_primary:.4f} + underlying={underlying_bonus:.4f}) | "
-                            f"fallback_total={total_score_fallback:.4f} (contract={contract_score_fallback:.4f} + liq={liquidity_bonus_fallback:.4f} + underlying={underlying_bonus:.4f})"
-                        )
+                        if SCORE_MODE == "quality_first":
+                            logger.info(
+                                f"{ticker}: fallback selected | "
+                                f"primary_total={total_score_primary:.4f} fallback_total={total_score_fallback:.4f}"
+                            )
+                        else:
+                            logger.info(
+                                f"{ticker}: fallback selected | "
+                                f"primary_total={total_score_primary:.4f} (contract={contract_score_primary:.4f} + liq={liquidity_bonus_primary:.4f} + underlying={underlying_bonus:.4f}) | "
+                                f"fallback_total={total_score_fallback:.4f} (contract={contract_score_fallback:.4f} + liq={liquidity_bonus_fallback:.4f} + underlying={underlying_bonus:.4f})"
+                            )
                     else:
                         window_used = "primary"
                         selection_reason = "primary_better_score"
-                        logger.info(
-                            f"{ticker}: primary selected | "
-                            f"primary_total={total_score_primary:.4f} (contract={contract_score_primary:.4f} + liq={liquidity_bonus_primary:.4f} + underlying={underlying_bonus:.4f}) | "
-                            f"fallback_total={total_score_fallback:.4f} (contract={contract_score_fallback:.4f} + liq={liquidity_bonus_fallback:.4f} + underlying={underlying_bonus:.4f})"
-                        )
+                        if SCORE_MODE == "quality_first":
+                            logger.info(
+                                f"{ticker}: primary selected | "
+                                f"primary_total={total_score_primary:.4f} fallback_total={total_score_fallback:.4f}"
+                            )
+                        else:
+                            logger.info(
+                                f"{ticker}: primary selected | "
+                                f"primary_total={total_score_primary:.4f} (contract={contract_score_primary:.4f} + liq={liquidity_bonus_primary:.4f} + underlying={underlying_bonus:.4f}) | "
+                                f"fallback_total={total_score_fallback:.4f} (contract={contract_score_fallback:.4f} + liq={liquidity_bonus_fallback:.4f} + underlying={underlying_bonus:.4f})"
+                            )
                 else:
                     # Primary succeeded, fallback failed - use primary
                     window_used = "primary"
@@ -1241,36 +1339,59 @@ def main() -> None:
             # Calculate liquidity bonus
             liquidity_bonus = max(0.0, (0.05 - spread_pct) * 100.0)
             
-            # underlying_bonus already computed above (before window selection)
-            # Total score = contract_score + liquidity_bonus + underlying_bonus
-            total_score = contract_score + liquidity_bonus + underlying_bonus
+            # Compute total_score based on scoring mode
+            # underlying_bonus and fund_score already computed above (before window selection)
+            total_score, score_components = compute_total_score(
+                contract_score,
+                liquidity_bonus,
+                underlying_bonus,
+                underlying_breakdown,
+                fund_score,
+                SCORE_MODE,
+            )
 
             # Calculate required cash for CSP
             required_cash = strike * 100.0  # Full assignment value
             required_cash_net = required_cash - (bid * 100.0)  # Net cash after premium received
 
             # Log successful pick with total_score breakdown
-            logger.info(
-                f"{ticker}: pick created | window={window_used} | "
-                f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
-                f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
-                f"total_score={total_score:.4f} (contract={contract_score:.4f} + underlying={underlying_bonus:.4f} "
-                f"[fund={underlying_breakdown['fundamentals_bonus']:.2f} rsi={underlying_breakdown['rsi_bonus']:.2f} "
-                f"iv={underlying_breakdown['iv_bonus']:.2f} mr={underlying_breakdown['mr_bonus']:.2f}]) | "
-                f"required_cash_net=${required_cash_net:,.2f}"
-            )
+            if SCORE_MODE == "quality_first":
+                fund_comp = score_components.get("fundamentals_component", 0.0)
+                contract_comp = score_components.get("contract_component", 0.0)
+                tacticals_comp = score_components.get("tacticals_component", 0.0)
+                logger.info(
+                    f"{ticker}: pick created | window={window_used} | "
+                    f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
+                    f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
+                    f"total_score={total_score:.4f} | "
+                    f"fund_score={fund_score or 0:.1f} | "
+                    f"components: fund={fund_comp:.2f} contract={contract_comp:.4f} tacticals={tacticals_comp:.2f} | "
+                    f"required_cash_net=${required_cash_net:,.2f}"
+                )
+            else:
+                logger.info(
+                    f"{ticker}: pick created | window={window_used} | "
+                    f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
+                    f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
+                    f"total_score={total_score:.4f} (contract={contract_score:.4f} + underlying={underlying_bonus:.4f} "
+                    f"[fund={underlying_breakdown['fundamentals_bonus']:.2f} rsi={underlying_breakdown['rsi_bonus']:.2f} "
+                    f"iv={underlying_breakdown['iv_bonus']:.2f} mr={underlying_breakdown['mr_bonus']:.2f}]) | "
+                    f"required_cash_net=${required_cash_net:,.2f}"
+                )
 
             # Get RSI period/interval from candidate metrics or use defaults
-            candidate_metrics = c.get("metrics") or {}
             rsi_period = candidate_metrics.get("rsi_period") or rules.rsi_period
             rsi_interval = candidate_metrics.get("rsi_interval") or rules.rsi_interval
 
             # Build metadata object as specified
             metadata = {
                 "contract_score": contract_score,
-                "total_score": total_score,  # Total score (contract_score + liquidity_bonus + underlying_bonus)
+                "total_score": total_score,
+                "score_mode": SCORE_MODE,
+                "score_components": score_components,
                 "underlying_bonus": underlying_bonus,
                 "underlying_breakdown": underlying_breakdown,
+                "fund_score": fund_score,
                 "score_components": {
                     "annualized_yield": ann_yld,  # yield
                     "spread_pct": spread_pct,
