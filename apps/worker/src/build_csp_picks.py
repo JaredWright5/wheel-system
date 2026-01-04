@@ -59,6 +59,250 @@ if SCORE_MODE not in ("balanced", "quality_first"):
 
 # ---------- Helpers ----------
 
+def build_why_this_trade(*, symbol: str, pick: dict, metrics: dict, rules: Any) -> dict:
+    """
+    Build a structured explanation for why this CSP pick was generated.
+    
+    Args:
+        symbol: Stock symbol
+        pick: Pick row dict (from pick_rows)
+        metrics: Candidate metrics dict (from screening_candidates.metrics)
+        rules: WheelRules instance
+        
+    Returns:
+        JSON-serializable dict with:
+        - headline: str
+        - bullets: list[str]
+        - score_breakdown: dict
+        - risk_notes: list[str]
+    """
+    pick_metrics = pick.get("pick_metrics", {})
+    option_selected = pick_metrics.get("option_selected", {})
+    metadata = pick_metrics.get("metadata", {})
+    underlying_breakdown = option_selected.get("underlying_breakdown", {})
+    score_components = metadata.get("score_components", {})
+    rule_context = pick_metrics.get("rule_context", {})
+    
+    # Extract key values
+    delta = pick.get("delta", 0.0)
+    abs_delta = abs(delta)
+    dte = pick.get("dte", 0)
+    strike = pick.get("strike", 0.0)
+    bid = option_selected.get("bid", 0.0)
+    ask = option_selected.get("ask", 0.0)
+    mid = option_selected.get("mid", 0.0)
+    spread_abs = option_selected.get("spread_abs", 0.0)
+    spread_pct = option_selected.get("spread_pct", 0.0)
+    oi = option_selected.get("openInterest", 0)
+    ann_yld = pick.get("annualized_yield", 0.0)
+    window_used = metadata.get("used_dte_window", "primary")
+    required_cash_net = metadata.get("required_cash_net", 0.0)
+    
+    # Extract fundamentals
+    fund_score = metadata.get("fund_score")
+    if fund_score is None:
+        fund_score = underlying_breakdown.get("fundamentals_score")
+    
+    # Extract RSI
+    rsi_raw = pick.get("rsi")
+    rsi_value = None
+    if isinstance(rsi_raw, dict):
+        rsi_value = rsi_raw.get("value")
+    elif isinstance(rsi_raw, (int, float)):
+        rsi_value = rsi_raw
+    
+    # Extract IV
+    iv_current = pick.get("iv")
+    iv_rank = pick.get("iv_rank")
+    
+    # Extract earnings
+    earn_in_days = pick.get("earn_in_days")
+    earnings_avoid_days = rule_context.get("earnings_avoid_days", rules.earnings_avoid_days)
+    
+    # Extract liquidity flags
+    liquidity = metadata.get("liquidity", {})
+    min_bid_ok = liquidity.get("min_bid_ok", False)
+    spread_ok_status = liquidity.get("spread_ok", False)
+    oi_ok = liquidity.get("oi_ok", False)
+    
+    # Extract financial scores submetrics
+    financial_scores = metrics.get("financial_scores", {})
+    piotroski_score = financial_scores.get("piotroskiScore")
+    altman_z_score = financial_scores.get("altmanZScore")
+    
+    # Build headline
+    headline = f"CSP {symbol} ${strike:.2f} {dte}DTE: {ann_yld:.1%} yield, delta={abs_delta:.2f}"
+    
+    # Build bullets
+    bullets = []
+    
+    # 1) Strategy fit
+    delta_band = rule_context.get("delta_band", [rules.csp_delta_min, rules.csp_delta_max])
+    bullets.append(
+        f"CSP in target delta band (abs delta {abs_delta:.3f} in [{delta_band[0]:.2f}, {delta_band[1]:.2f}])"
+    )
+    if window_used == "primary":
+        bullets.append(
+            f"DTE in primary window ({rules.dte_min_primary}-{rules.dte_max_primary} days)"
+        )
+    elif window_used == "fallback":
+        bullets.append(
+            f"DTE in fallback window ({rules.dte_min_fallback}-{rules.dte_max_fallback} days)"
+        )
+    else:
+        bullets.append(f"DTE: {dte} days")
+    
+    # 2) Premium & pricing
+    credit_str = f"${bid:.2f}" if bid > 0 else "N/A"
+    bullets.append(f"Credit (bid) = {credit_str}, annualized yield = {ann_yld:.2%}")
+    
+    # 3) Liquidity
+    liquidity_parts = []
+    if min_bid_ok:
+        liquidity_parts.append(f"bid >= ${rules.min_bid:.2f}")
+    if spread_ok_status:
+        liquidity_parts.append(f"spread {spread_pct:.1f}% (abs ${spread_abs:.2f})")
+    if oi_ok:
+        liquidity_parts.append(f"OI >= {rules.min_open_interest}")
+    if liquidity_parts:
+        bullets.append(f"Liquidity: {'; '.join(liquidity_parts)} (OI={oi})")
+    else:
+        bullets.append(f"Liquidity: spread {spread_pct:.1f}%, OI={oi}")
+    
+    # 4) Fundamentals
+    if fund_score is not None:
+        fund_diff = fund_score - 50.0
+        if fund_diff > 10:
+            fund_desc = "strong"
+        elif fund_diff > 0:
+            fund_desc = "above neutral"
+        elif fund_diff > -10:
+            fund_desc = "near neutral"
+        else:
+            fund_desc = "below neutral"
+        bullets.append(f"Fundamentals score: {fund_score:.1f}/100 ({fund_desc}, neutral=50)")
+        
+        # Add financial scores submetrics if present
+        strong_metrics = []
+        if piotroski_score is not None:
+            strong_metrics.append(f"Piotroski={piotroski_score:.1f}")
+        if altman_z_score is not None:
+            strong_metrics.append(f"Altman Z={altman_z_score:.2f}")
+        if strong_metrics:
+            bullets.append(f"Financial quality: {', '.join(strong_metrics)}")
+    else:
+        bullets.append("Fundamentals score: N/A")
+    
+    # 5) Technicals (RSI)
+    if rsi_value is not None:
+        if rsi_value < 35:
+            rsi_desc = "oversold-ish"
+        elif rsi_value < 55:
+            rsi_desc = "neutral"
+        elif rsi_value < 70:
+            rsi_desc = "strong"
+        else:
+            rsi_desc = "overbought-ish"
+        bullets.append(f"RSI: {rsi_value:.1f} ({rsi_desc})")
+    else:
+        bullets.append("RSI: N/A")
+    
+    # 6) Volatility
+    if iv_current is not None:
+        bullets.append(f"IV: {iv_current:.2%}")
+        if iv_rank is not None:
+            bullets.append(f"IV Rank: {iv_rank:.1f}/100")
+        else:
+            bullets.append("IV Rank: not available yet (insufficient history)")
+    else:
+        bullets.append("IV: N/A")
+    
+    # 7) Earnings
+    if earn_in_days is not None:
+        try:
+            earn_days_int = int(earn_in_days)
+            if earn_days_int >= earnings_avoid_days:
+                bullets.append(
+                    f"Earnings avoided: next earnings in {earn_days_int} days (threshold={earnings_avoid_days})"
+                )
+            else:
+                bullets.append(
+                    f"Earnings: next in {earn_days_int} days (within avoid window, but pick generated)"
+                )
+        except (ValueError, TypeError):
+            bullets.append("Earnings date unknown (treated as allowed)")
+    else:
+        bullets.append("Earnings date unknown (treated as allowed)")
+    
+    # Build score breakdown
+    total_score = metadata.get("total_score") or metadata.get("chosen_total_score", 0.0)
+    contract_score = option_selected.get("contract_score", 0.0)
+    underlying_bonus = option_selected.get("underlying_bonus", 0.0)
+    fundamentals_bonus = underlying_breakdown.get("fundamentals_bonus", 0.0)
+    rsi_bonus = underlying_breakdown.get("rsi_bonus", 0.0)
+    iv_bonus = underlying_breakdown.get("iv_bonus", 0.0)
+    mr_bonus = underlying_breakdown.get("mr_bonus", 0.0)
+    fundamentals_penalty = underlying_breakdown.get("fundamentals_penalty", 0.0)
+    score_mode = metadata.get("score_mode", SCORE_MODE)
+    
+    # Get fundamentals component (mode-specific)
+    if score_mode == "quality_first":
+        fundamentals_component = score_components.get("fundamentals_component", 0.0)
+        score_breakdown = {
+            "total_score": total_score,
+            "contract_score": contract_score,
+            "underlying_bonus": underlying_bonus,
+            "fundamentals_component": fundamentals_component,
+            "rsi_bonus": rsi_bonus,
+            "iv_bonus": iv_bonus,
+            "mean_reversion_bonus": mr_bonus,
+            "fundamentals_penalty": fundamentals_penalty,
+            "score_mode": score_mode,
+        }
+    else:
+        score_breakdown = {
+            "total_score": total_score,
+            "contract_score": contract_score,
+            "underlying_bonus": underlying_bonus,
+            "fundamentals_bonus": fundamentals_bonus,
+            "rsi_bonus": rsi_bonus,
+            "iv_bonus": iv_bonus,
+            "mean_reversion_bonus": mr_bonus,
+            "fundamentals_penalty": fundamentals_penalty,
+            "score_mode": score_mode,
+        }
+    
+    # Build risk notes
+    risk_notes = []
+    
+    # Assignment risk
+    risk_notes.append(f"Assignment risk: willing to own 100 shares at ${strike:.2f}")
+    
+    # Concentration risk
+    if required_cash_net > 0:
+        risk_notes.append(
+            f"Concentration risk: high notional vs account size (required_cash_net=${required_cash_net:,.2f})"
+        )
+    
+    # High premium risk
+    if ann_yld > 0.60:
+        risk_notes.append("High premium can imply higher tail risk / volatility")
+    
+    # Wide spread risk
+    if spread_pct > 0.10:
+        risk_notes.append("Wide spread: be careful with limit orders")
+    
+    # Share class duplication (only if duplicate rule triggered - we can't detect this here, so omit)
+    # This would require tracking which picks were skipped due to duplicate exposure
+    
+    return {
+        "headline": headline,
+        "bullets": bullets,
+        "score_breakdown": score_breakdown,
+        "risk_notes": risk_notes,
+    }
+
+
 def normalize_exposure_symbol(symbol: str) -> str:
     """
     Normalize symbol to prevent duplicate economic exposure.
@@ -1897,7 +2141,7 @@ def main() -> None:
             logger.info(f"  └─ {fund_str} | {rsi_str} | {iv_str} ({iv_rank_str}) | {earn_str}")
         logger.info("=" * 80)
 
-    # 3) Delete existing CSP picks for this run_id, then insert new ones
+    # 4) Delete existing CSP picks for this run_id, then insert new ones
     # (This ensures idempotent reruns)
     logger.info(f"Deleting existing CSP picks for run_id={run_id}")
     delete_res = (
@@ -1908,7 +2152,7 @@ def main() -> None:
         .execute()
     )
 
-    # 4) Insert new picks (batch insert)
+    # 5) Insert new picks (batch insert)
     logger.info(f"Inserting {len(pick_rows)} screening_picks rows...")
     insert_res = sb.table("screening_picks").insert(pick_rows).execute()
     
