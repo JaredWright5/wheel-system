@@ -6,7 +6,7 @@ Includes dynamic portfolio budget fetching from Schwab and portfolio selection.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime as dt, timezone, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import os
 import math
@@ -956,7 +956,7 @@ def _choose_best_put_in_delta_band(
     if not options:
         return None
 
-    today = datetime.now(timezone.utc).date()
+    today = dt.now(timezone.utc).date()
     dte = (expiration - today).days
 
     candidates: List[Dict[str, Any]] = []
@@ -1314,7 +1314,7 @@ def main() -> None:
     earnings_known = 0
     earnings_unknown = 0
 
-    now = datetime.now(timezone.utc).date()
+    now = dt.now(timezone.utc).date()
 
     scanned_candidates = 0
     for i, c in enumerate(cands, start=1):
@@ -2081,7 +2081,7 @@ def main() -> None:
                 earn_days_int = int(earn_in_days)
                 if earn_days_int >= 0:
                     # Approximate earnings date (today + days)
-                    today = datetime.now(ZoneInfo("America/Los_Angeles")).date()
+                    today = dt.now(ZoneInfo("America/Los_Angeles")).date()
                     earnings_date = (today + timedelta(days=earn_days_int)).isoformat()
                     days_to_earnings = earn_days_int
             except (ValueError, TypeError):
