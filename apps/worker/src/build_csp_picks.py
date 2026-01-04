@@ -1388,11 +1388,11 @@ def main() -> None:
                 "contract_score": contract_score,
                 "total_score": total_score,
                 "score_mode": SCORE_MODE,
-                "score_components": score_components,
+                "score_components": score_components,  # Mode-specific score components
                 "underlying_bonus": underlying_bonus,
                 "underlying_breakdown": underlying_breakdown,
                 "fund_score": fund_score,
-                "score_components": {
+                "contract_details": {
                     "annualized_yield": ann_yld,  # yield
                     "spread_pct": spread_pct,
                     "open_interest": oi,  # oi
