@@ -2143,6 +2143,10 @@ def main() -> None:
         }
         
         # Store trade card in pick_metrics
+        # Preserve why_this_trade if it already exists (from pick generation)
+        existing_trade_card = pick_rows[idx]["pick_metrics"].get("trade_card", {})
+        if isinstance(existing_trade_card, dict) and "why_this_trade" in existing_trade_card:
+            trade_card["why_this_trade"] = existing_trade_card["why_this_trade"]
         pick_rows[idx]["pick_metrics"]["trade_card"] = trade_card
     
     # 2c) Log trade cards for selected picks
