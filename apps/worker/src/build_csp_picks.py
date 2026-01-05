@@ -34,13 +34,13 @@ RUN_ID = os.getenv("RUN_ID")  # None = use latest
 
 # Target-based pick generation parameters
 CSP_MAX_CANDIDATES_TO_SCAN = int(os.getenv("CSP_MAX_CANDIDATES_TO_SCAN", "100"))
-CSP_TARGET_PICKS = int(os.getenv("CSP_TARGET_PICKS", "10"))
+# CSP_TARGET_PICKS will be set after SCORE_MODE is determined (below)
 
 # Maximum annualized yield (as decimal, e.g., 3.0 = 300%)
 MAX_ANNUALIZED_YIELD = float(os.getenv("MAX_ANNUALIZED_YIELD", "3.0"))
 
 # Portfolio budget and selection parameters
-WHEEL_CSP_MAX_TRADES = int(os.getenv("WHEEL_CSP_MAX_TRADES", "4"))
+# WHEEL_CSP_MAX_TRADES will be set after SCORE_MODE is determined (below)
 WHEEL_CSP_MIN_CASH_BUFFER_PCT = float(os.getenv("WHEEL_CSP_MIN_CASH_BUFFER_PCT", "0.10"))
 WHEEL_CSP_MAX_CASH_PER_TRADE = float(os.getenv("WHEEL_CSP_MAX_CASH_PER_TRADE", "25000.0"))
 WHEEL_CASH_EQUIVALENT_SYMBOLS = os.getenv("WHEEL_CASH_EQUIVALENT_SYMBOLS", "SWVXX").strip()
@@ -50,11 +50,48 @@ DEFAULT_PORTFOLIO_CASH = 50000.0  # Fallback if Schwab fetch fails
 WHEEL_MIN_TOTAL_SCORE = float(os.getenv("WHEEL_MIN_TOTAL_SCORE", "0.0"))
 WHEEL_ALLOW_NEGATIVE_SELECTION = os.getenv("WHEEL_ALLOW_NEGATIVE_SELECTION", "false").lower() in ("true", "1", "yes")
 
-# Scoring mode: "balanced" (default) or "quality_first"
-SCORE_MODE = os.getenv("WHEEL_SCORE_MODE", "balanced").lower()
-if SCORE_MODE not in ("balanced", "quality_first"):
-    logger.warning(f"Invalid WHEEL_SCORE_MODE={SCORE_MODE}, using 'balanced'")
+# Scoring mode: "balanced" (default) or "quality"
+# Support both SCORING_MODE (new) and WHEEL_SCORE_MODE (backward compatibility)
+SCORE_MODE = os.getenv("SCORING_MODE") or os.getenv("WHEEL_SCORE_MODE", "balanced")
+SCORE_MODE = SCORE_MODE.lower()
+# Map legacy "quality_first" to "quality"
+if SCORE_MODE == "quality_first":
+    SCORE_MODE = "quality"
+if SCORE_MODE not in ("balanced", "quality"):
+    logger.warning(f"Invalid SCORING_MODE={SCORE_MODE}, using 'balanced'")
     SCORE_MODE = "balanced"
+
+# Scoring profiles with weights for each mode
+SCORING_PROFILES = {
+    "balanced": {
+        "weights": {"contract": 1.0, "underlying": 1.0},
+        "underlying_weights": {"fund": 0.55, "rsi": 0.15, "iv": 0.20, "mr": 0.10},
+    },
+    "quality": {
+        "weights": {"contract": 0.65, "underlying": 1.35},
+        "underlying_weights": {"fund": 0.75, "rsi": 0.10, "iv": 0.10, "mr": 0.05},
+    },
+}
+
+# Mode-specific defaults (overridden by env vars)
+MAX_TRADES_DEFAULT = {"balanced": 4, "quality": 1}
+TARGET_PICKS_DEFAULT = {"balanced": 10, "quality": 5}
+
+# Portfolio selection parameters (mode-specific defaults)
+# Priority: explicit MAX_TRADES env var > WHEEL_CSP_MAX_TRADES env var > mode default
+MAX_TRADES_ENV = os.getenv("MAX_TRADES") or os.getenv("WHEEL_CSP_MAX_TRADES")
+if MAX_TRADES_ENV:
+    WHEEL_CSP_MAX_TRADES = int(MAX_TRADES_ENV)
+else:
+    WHEEL_CSP_MAX_TRADES = MAX_TRADES_DEFAULT.get(SCORE_MODE, 4)
+
+# Target picks (mode-specific defaults)
+# Priority: explicit TARGET_PICKS env var > CSP_TARGET_PICKS env var > mode default
+TARGET_PICKS_ENV = os.getenv("TARGET_PICKS") or os.getenv("CSP_TARGET_PICKS")
+if TARGET_PICKS_ENV:
+    CSP_TARGET_PICKS = int(TARGET_PICKS_ENV)
+else:
+    CSP_TARGET_PICKS = TARGET_PICKS_DEFAULT.get(SCORE_MODE, 10)
 
 
 # ---------- Helpers ----------
@@ -257,6 +294,23 @@ def build_why_this_trade(*, symbol: str, pick: dict, metrics: dict, rules: Any) 
     else:
         bullets.append("Earnings date unknown (treated as allowed)")
     
+    # Scoring mode and quality penalties/bonuses (if quality mode)
+    score_mode = metadata.get("score_mode", SCORE_MODE)
+    if score_mode == "quality":
+        bullets.append("Scoring mode: quality (fundamentals-weighted; premium de-emphasized)")
+        
+        # Add penalties/bonuses bullets
+        quality_penalty_descriptions = metadata.get("quality_penalty_descriptions", [])
+        quality_bonus_descriptions = metadata.get("quality_bonus_descriptions", [])
+        
+        if quality_penalty_descriptions:
+            penalties_str = ", ".join(quality_penalty_descriptions)
+            bullets.append(f"Penalties applied: {penalties_str}")
+        
+        if quality_bonus_descriptions:
+            bonuses_str = ", ".join(quality_bonus_descriptions)
+            bullets.append(f"Bonuses applied: {bonuses_str}")
+    
     # Build score breakdown
     total_score = metadata.get("total_score") or metadata.get("chosen_total_score", 0.0)
     contract_score = option_selected.get("contract_score", 0.0)
@@ -266,11 +320,11 @@ def build_why_this_trade(*, symbol: str, pick: dict, metrics: dict, rules: Any) 
     iv_bonus = underlying_breakdown.get("iv_bonus", 0.0)
     mr_bonus = underlying_breakdown.get("mr_bonus", 0.0)
     fundamentals_penalty = underlying_breakdown.get("fundamentals_penalty", 0.0)
-    score_mode = metadata.get("score_mode", SCORE_MODE)
     
     # Get fundamentals component (mode-specific)
-    if score_mode == "quality_first":
+    if score_mode == "quality" or score_mode == "quality_first":
         fundamentals_component = score_components.get("fundamentals_component", 0.0)
+        quality_adjustment = metadata.get("quality_adjustment", 0.0)
         score_breakdown = {
             "total_score": total_score,
             "contract_score": contract_score,
@@ -280,6 +334,7 @@ def build_why_this_trade(*, symbol: str, pick: dict, metrics: dict, rules: Any) 
             "iv_bonus": iv_bonus,
             "mean_reversion_bonus": mr_bonus,
             "fundamentals_penalty": fundamentals_penalty,
+            "quality_adjustment": quality_adjustment if score_mode == "quality" else None,
             "score_mode": score_mode,
         }
     else:
@@ -608,6 +663,106 @@ def compute_underlying_bonus(c: Dict[str, Any]) -> Tuple[float, Dict[str, float]
     return underlying_bonus, breakdown
 
 
+def compute_quality_penalties_and_bonuses(
+    fund_score: Optional[float],
+    rsi: Optional[float],
+    iv_current: Optional[float],
+    iv_rank: Optional[float],
+    iv_zscore: Optional[float],
+) -> Tuple[float, Dict[str, float], List[str], List[str]]:
+    """
+    Compute quality mode penalties and bonuses.
+    
+    Args:
+        fund_score: Fundamentals score (0-100)
+        rsi: RSI value (0-100)
+        iv_current: Current IV (as percent, e.g., 20.91)
+        iv_rank: IV Rank (0-100)
+        iv_zscore: IV Z-score (mean reversion metric)
+        
+    Returns:
+        (total_adjustment, breakdown_dict, penalty_descriptions, bonus_descriptions)
+        - total_adjustment: sum of penalties and bonuses
+        - breakdown_dict: dict with individual penalty/bonus components
+        - penalty_descriptions: list of penalty description strings
+        - bonus_descriptions: list of bonus description strings
+    """
+    breakdown = {
+        "rsi_overbought_penalty": 0.0,
+        "junk_premium_penalty": 0.0,
+        "iv_rank_froth_penalty": 0.0,
+        "mean_reversion_penalty": 0.0,
+        "strong_fundamentals_bonus": 0.0,
+        "reasonable_iv_bonus": 0.0,
+    }
+    penalty_descriptions = []
+    bonus_descriptions = []
+    
+    # Treat None as neutral (no penalty/bonus)
+    fund_score_val = fund_score if fund_score is not None else 50.0
+    rsi_val = rsi
+    iv_current_val = iv_current
+    iv_rank_val = iv_rank
+    iv_zscore_val = iv_zscore
+    
+    # 1) RSI Overbought penalty
+    if rsi_val is not None:
+        if rsi_val >= 80:
+            breakdown["rsi_overbought_penalty"] = -10.0
+            penalty_descriptions.append(f"RSI overbought (-10.0)")
+        elif rsi_val >= 75:
+            breakdown["rsi_overbought_penalty"] = -6.0
+            penalty_descriptions.append(f"RSI overbought (-6.0)")
+        elif rsi_val >= 70:
+            breakdown["rsi_overbought_penalty"] = -3.0
+            penalty_descriptions.append(f"RSI overbought (-3.0)")
+    
+    # 2) "Junk premium" penalty (high IV but low fundamentals)
+    if iv_current_val is not None:
+        if iv_current_val >= 80 and fund_score_val < 60:
+            breakdown["junk_premium_penalty"] = -12.0
+            penalty_descriptions.append(f"Junk premium (-12.0)")
+        elif iv_current_val >= 60 and fund_score_val < 55:
+            breakdown["junk_premium_penalty"] = -8.0
+            penalty_descriptions.append(f"Junk premium (-8.0)")
+    
+    # 3) IV Rank froth penalty
+    if iv_rank_val is not None:
+        if iv_rank_val >= 95:
+            breakdown["iv_rank_froth_penalty"] = -6.0
+            penalty_descriptions.append(f"IV froth (-6.0)")
+        elif iv_rank_val >= 90:
+            breakdown["iv_rank_froth_penalty"] = -4.0
+            penalty_descriptions.append(f"IV froth (-4.0)")
+    
+    # 4) Mean reversion penalty (positive z-score means above mean = over-extended)
+    if iv_zscore_val is not None:
+        if iv_zscore_val >= 2.0:
+            breakdown["mean_reversion_penalty"] = -7.0
+            penalty_descriptions.append(f"Mean reversion extended (-7.0)")
+        elif iv_zscore_val >= 1.5:
+            breakdown["mean_reversion_penalty"] = -4.0
+            penalty_descriptions.append(f"Mean reversion extended (-4.0)")
+    
+    # 5) "Strong fundamentals" bonus
+    if fund_score_val >= 92:
+        breakdown["strong_fundamentals_bonus"] = 5.0
+        bonus_descriptions.append(f"Strong fundamentals (+5.0)")
+    elif fund_score_val >= 85:
+        breakdown["strong_fundamentals_bonus"] = 3.0
+        bonus_descriptions.append(f"Strong fundamentals (+3.0)")
+    
+    # 6) "Reasonable IV" bonus
+    if iv_current_val is not None and 20.0 <= iv_current_val <= 45.0:
+        breakdown["reasonable_iv_bonus"] = 1.5
+        bonus_descriptions.append(f"Reasonable IV (+1.5)")
+    
+    # Total adjustment
+    total_adjustment = sum(breakdown.values())
+    
+    return total_adjustment, breakdown, penalty_descriptions, bonus_descriptions
+
+
 def compute_total_score(
     contract_score: float,
     liquidity_bonus: float,
@@ -615,24 +770,30 @@ def compute_total_score(
     underlying_breakdown: Dict[str, float],
     fund_score: Optional[float],
     score_mode: str,
+    quality_adjustment: float = 0.0,
 ) -> Tuple[float, Dict[str, Any]]:
     """
-    Compute total_score based on scoring mode.
+    Compute total_score based on scoring mode using SCORING_PROFILES.
     
     Args:
         contract_score: Option contract score (unchanged)
         liquidity_bonus: Liquidity bonus (unchanged)
         underlying_bonus: Underlying bonus (for balanced mode)
         underlying_breakdown: Breakdown dict with fund/rsi/iv/mr bonuses
-        fund_score: Fundamentals score (0-100, for quality_first mode)
-        score_mode: "balanced" or "quality_first"
+        fund_score: Fundamentals score (0-100)
+        score_mode: "balanced" or "quality"
+        quality_adjustment: Quality mode penalties/bonuses (default 0.0)
         
     Returns:
         (total_score, components_dict)
-        components_dict includes: fundamentals_component, contract_component, tacticals_component (for quality_first)
-        or contract_score, liquidity_bonus, underlying_bonus (for balanced)
+        components_dict includes mode-specific score components
     """
-    if score_mode == "quality_first":
+    profile = SCORING_PROFILES.get(score_mode, SCORING_PROFILES["balanced"])
+    weights = profile["weights"]
+    underlying_weights = profile.get("underlying_weights", {})
+    
+    if score_mode == "quality":
+        # Quality mode: use weighted components
         # fundamentals_component = (fund_score - 50) * 0.8
         # So 50->0, 80->+24, 100->+40, 30->-16
         if fund_score is not None:
@@ -651,12 +812,22 @@ def compute_total_score(
         )
         tacticals_component = max(-5.0, min(10.0, tacticals_raw))
         
-        # total_score = 0.60 * fundamentals_component + 0.25 * contract_component + 0.15 * tacticals_component
+        # Use profile weights for quality mode:
+        # total_score = contract_weight * contract + underlying_weight * (fund + tacticals)
+        # Normalize weights to sum to 1.0 for interpretation
+        # weights["contract"] = 0.65, weights["underlying"] = 1.35
+        # Normalize: contract_norm = 0.65 / (0.65 + 1.35) = 0.325, underlying_norm = 1.35 / 2.0 = 0.675
+        # But user wants direct weights, so use as-is
+        contract_weight = weights["contract"]
+        underlying_weight = weights["underlying"]
+        
         total_score = (
-            0.60 * fundamentals_component +
-            0.25 * contract_component +
-            0.15 * tacticals_component
+            contract_weight * contract_component +
+            underlying_weight * (fundamentals_component + tacticals_component)
         )
+        
+        # Add quality penalties/bonuses (additive adjustments)
+        total_score += quality_adjustment
         
         return total_score, {
             "fundamentals_component": fundamentals_component,
@@ -1312,7 +1483,20 @@ def attempt_window(
 def main() -> None:
     # Load wheel rules
     rules = load_wheel_rules()
-    logger.info(f"Scoring mode: {SCORE_MODE}")
+    
+    # Log scoring mode and profile weights
+    profile = SCORING_PROFILES.get(SCORE_MODE, SCORING_PROFILES["balanced"])
+    weights = profile["weights"]
+    underlying_weights = profile.get("underlying_weights", {})
+    max_trades_default = MAX_TRADES_DEFAULT.get(SCORE_MODE, 4)
+    
+    logger.info(
+        f"Scoring mode: {SCORE_MODE} | "
+        f"weights: contract={weights['contract']:.2f} underlying={weights['underlying']:.2f} | "
+        f"underlying mix: fund={underlying_weights.get('fund', 0.55):.2f} rsi={underlying_weights.get('rsi', 0.15):.2f} "
+        f"iv={underlying_weights.get('iv', 0.20):.2f} mr={underlying_weights.get('mr', 0.10):.2f} | "
+        f"max_trades_default={max_trades_default}"
+    )
     logger.info(
         f"Selection rule: min_total_score={WHEEL_MIN_TOTAL_SCORE:.2f}, allow_negative_selection={WHEEL_ALLOW_NEGATIVE_SELECTION}"
     )
@@ -1474,6 +1658,26 @@ def main() -> None:
             # Extract fund_score from candidate metrics (used in scoring)
             candidate_metrics = c.get("metrics") or {}
             fund_score = _extract_fundamentals_score(candidate_metrics)
+            
+            # Compute quality penalties/bonuses once per candidate (used in scoring and comparison)
+            quality_adjustment_for_comparison = 0.0
+            if SCORE_MODE == "quality":
+                iv_data = candidate_metrics.get("iv") or {}
+                iv_rank = _safe_float(iv_data.get("rank") if isinstance(iv_data, dict) else None)
+                iv_current = _safe_float(iv_data.get("current") if isinstance(iv_data, dict) else None)
+                iv_zscore = _safe_float(iv_data.get("zscore") if isinstance(iv_data, dict) else None)
+                
+                rsi_data = candidate_metrics.get("rsi") or {}
+                rsi_value = rsi_data.get("value") if isinstance(rsi_data, dict) else (rsi_data if isinstance(rsi_data, (int, float)) else None)
+                rsi = _safe_float(rsi_value)
+                
+                quality_adjustment_for_comparison, _, _, _ = compute_quality_penalties_and_bonuses(
+                    fund_score=fund_score,
+                    rsi=rsi,
+                    iv_current=iv_current,
+                    iv_rank=iv_rank,
+                    iv_zscore=iv_zscore,
+                )
 
             # Try primary window first
             best_primary, exp_primary, diag_primary = attempt_window(
@@ -1530,6 +1734,7 @@ def main() -> None:
                         underlying_breakdown,
                         fund_score_for_scoring,
                         SCORE_MODE,
+                        quality_adjustment_for_comparison,
                     )
                     
                     # Extract fallback comparison data
@@ -1547,6 +1752,7 @@ def main() -> None:
                         underlying_breakdown,
                         fund_score_for_scoring,
                         SCORE_MODE,
+                        quality_adjustment_for_comparison,
                     )
                     
                     # Store comparison data (underlying_bonus computed above)
@@ -1579,7 +1785,7 @@ def main() -> None:
                         exp = exp_fallback
                         window_used = "fallback"
                         selection_reason = "fallback_better_score"
-                        if SCORE_MODE == "quality_first":
+                        if SCORE_MODE == "quality":
                             logger.info(
                                 f"{ticker}: fallback selected | "
                                 f"primary_total={total_score_primary:.4f} fallback_total={total_score_fallback:.4f}"
@@ -1593,7 +1799,7 @@ def main() -> None:
                     else:
                         window_used = "primary"
                         selection_reason = "primary_better_score"
-                        if SCORE_MODE == "quality_first":
+                        if SCORE_MODE == "quality":
                             logger.info(
                                 f"{ticker}: primary selected | "
                                 f"primary_total={total_score_primary:.4f} fallback_total={total_score_fallback:.4f}"
@@ -1757,6 +1963,30 @@ def main() -> None:
             # Calculate liquidity bonus
             liquidity_bonus = max(0.0, (0.05 - spread_pct) * 100.0)
             
+            # Compute quality penalties/bonuses if in quality mode
+            quality_adjustment = 0.0
+            quality_penalty_descriptions = []
+            quality_bonus_descriptions = []
+            if SCORE_MODE == "quality":
+                # Extract IV and RSI metrics from candidate_metrics
+                iv_data = candidate_metrics.get("iv") or {}
+                iv_rank = _safe_float(iv_data.get("rank") if isinstance(iv_data, dict) else None)
+                iv_current = _safe_float(iv_data.get("current") if isinstance(iv_data, dict) else None)
+                iv_zscore = _safe_float(iv_data.get("zscore") if isinstance(iv_data, dict) else None)
+                
+                rsi_data = candidate_metrics.get("rsi") or {}
+                rsi_value = rsi_data.get("value") if isinstance(rsi_data, dict) else (rsi_data if isinstance(rsi_data, (int, float)) else None)
+                rsi = _safe_float(rsi_value)
+                
+                # Compute quality penalties/bonuses
+                quality_adjustment, quality_breakdown, quality_penalty_descriptions, quality_bonus_descriptions = compute_quality_penalties_and_bonuses(
+                    fund_score=fund_score,
+                    rsi=rsi,
+                    iv_current=iv_current,
+                    iv_rank=iv_rank,
+                    iv_zscore=iv_zscore,
+                )
+            
             # Compute total_score based on scoring mode
             # underlying_bonus and fund_score already computed above (before window selection)
             # Use fund_score or 50.0 (neutral) if None for scoring
@@ -1768,6 +1998,7 @@ def main() -> None:
                 underlying_breakdown,
                 fund_score_for_scoring,
                 SCORE_MODE,
+                quality_adjustment,
             )
 
             # Calculate required cash for CSP
@@ -1775,18 +2006,19 @@ def main() -> None:
             required_cash_net = required_cash - (bid * 100.0)  # Net cash after premium received
 
             # Log successful pick with total_score breakdown
-            if SCORE_MODE == "quality_first":
+            if SCORE_MODE == "quality":
                 fund_comp = score_components.get("fundamentals_component", 0.0)
                 contract_comp = score_components.get("contract_component", 0.0)
                 tacticals_comp = score_components.get("tacticals_component", 0.0)
                 fund_score_display = f"{fund_score:.1f}" if fund_score is not None else "NA"
+                quality_adj_str = f" quality_adj={quality_adjustment:+.2f}" if quality_adjustment != 0.0 else ""
                 logger.info(
                     f"{ticker}: pick created | window={window_used} | "
                     f"exp={exp.isoformat()} | dte={dte} | strike={strike} | "
                     f"bid={bid:.2f} | delta={delta:.3f} | yield={ann_yld:.2%} | "
                     f"total_score={total_score:.4f} | "
                     f"fund_score={fund_score_display} | "
-                    f"components: fund={fund_comp:.2f} contract={contract_comp:.4f} tacticals={tacticals_comp:.2f} | "
+                    f"components: fund={fund_comp:.2f} contract={contract_comp:.4f} tacticals={tacticals_comp:.2f}{quality_adj_str} | "
                     f"required_cash_net=${required_cash_net:,.2f}"
                 )
             else:
@@ -1814,6 +2046,9 @@ def main() -> None:
                 "underlying_bonus": underlying_bonus,
                 "underlying_breakdown": underlying_breakdown,
                 "fund_score": fund_score,
+                "quality_adjustment": quality_adjustment if SCORE_MODE == "quality" else None,
+                "quality_penalty_descriptions": quality_penalty_descriptions if SCORE_MODE == "quality" else [],
+                "quality_bonus_descriptions": quality_bonus_descriptions if SCORE_MODE == "quality" else [],
                 "contract_details": {
                     "annualized_yield": ann_yld,  # yield
                     "spread_pct": spread_pct,
